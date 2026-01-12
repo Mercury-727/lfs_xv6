@@ -8,6 +8,11 @@
 // This file contains the low-level file system manipulation
 // routines.  The (higher-level) system call implementations
 // are in sysfile.c.
+//
+// LFS (Log-structured File System) implementation:
+// - All writes go to the log tail
+// - Inode locations tracked via imap
+// - Checkpoint stores imap locations
 
 #include "types.h"
 #include "defs.h"
@@ -22,10 +27,30 @@
 #include "file.h"
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
+
 static void itrunc(struct inode*);
-// there should be one superblock per disk device, but we run with
-// only one device
-struct superblock sb; 
+static void lfs_flush_inodes(void);
+static void lfs_write_imap(void);
+
+// There should be one superblock per disk device, but we run with only one device
+struct superblock sb;
+
+// LFS state
+struct {
+  struct spinlock lock;
+  uint imap[LFS_NINODES];      // inode number -> (block_addr << 3) | slot_index
+  struct checkpoint cp;        // current checkpoint
+  uint log_tail;               // next block to write
+  int dev;                     // device number
+} lfs;
+
+// Dirty inode buffer - holds up to IPB (8) inodes before writing
+struct {
+  struct spinlock lock;
+  struct dinode inodes[IPB];   // buffered dirty inodes
+  uint inums[IPB];             // corresponding inode numbers
+  int count;                   // number of dirty inodes in buffer
+} dirty_inodes;
 
 // Read the super block.
 void
@@ -38,60 +63,199 @@ readsb(int dev, struct superblock *sb)
   brelse(bp);
 }
 
-// Zero a block.
+// Read checkpoint from disk
 static void
-bzero(int dev, int bno)
+lfs_read_checkpoint(int dev)
 {
   struct buf *bp;
 
-  bp = bread(dev, bno);
-  memset(bp->data, 0, BSIZE);
-  log_write(bp);
+  // Read checkpoint0
+  bp = bread(dev, sb.checkpoint0);
+  memmove(&lfs.cp, bp->data, sizeof(lfs.cp));
   brelse(bp);
+
+  if(lfs.cp.valid == 0){
+    panic("lfs_read_checkpoint: invalid checkpoint");
+  }
+
+  lfs.log_tail = lfs.cp.log_tail;
 }
 
-// Blocks.
-
-// Allocate a zeroed disk block.
-static uint
-balloc(uint dev)
+// Read imap from disk (locations stored in checkpoint)
+static void
+lfs_read_imap(int dev)
 {
-  int b, bi, m;
   struct buf *bp;
+  uint i, j;
+  uint *p;
 
-  bp = 0;
-  for(b = 0; b < sb.size; b += BPB){
-    bp = bread(dev, BBLOCK(b, sb));
-    for(bi = 0; bi < BPB && b + bi < sb.size; bi++){
-      m = 1 << (bi % 8);
-      if((bp->data[bi/8] & m) == 0){  // Is block free?
-        bp->data[bi/8] |= m;  // Mark block in use.
-        log_write(bp);
-        brelse(bp);
-        bzero(dev, b + bi);
-        return b + bi;
-      }
+  memset(lfs.imap, 0, sizeof(lfs.imap));
+
+  for(i = 0; i < lfs.cp.imap_nblocks && i < NIMAP_BLOCKS; i++){
+    bp = bread(dev, lfs.cp.imap_addrs[i]);
+    p = (uint*)bp->data;
+    for(j = 0; j < IMAP_ENTRIES_PER_BLOCK && (i * IMAP_ENTRIES_PER_BLOCK + j) < LFS_NINODES; j++){
+      lfs.imap[i * IMAP_ENTRIES_PER_BLOCK + j] = p[j];
     }
     brelse(bp);
   }
-  panic("balloc: out of blocks");
 }
 
-// Free a disk block.
+// Write checkpoint to disk (just checkpoint, no flush/imap)
 static void
-bfree(int dev, uint b)
+lfs_write_checkpoint(void)
 {
   struct buf *bp;
-  int bi, m;
+  struct checkpoint cp_copy;
 
-  bp = bread(dev, BBLOCK(b, sb));
-  bi = b % BPB;
-  m = 1 << (bi % 8);
-  if((bp->data[bi/8] & m) == 0)
-    panic("freeing free block");
-  bp->data[bi/8] &= ~m;
-  log_write(bp);
+  // Copy checkpoint data under lock
+  acquire(&lfs.lock);
+  lfs.cp.timestamp++;
+  lfs.cp.log_tail = lfs.log_tail;
+  lfs.cp.cur_seg = (lfs.log_tail - sb.segstart) / sb.segsize;
+  lfs.cp.seg_offset = (lfs.log_tail - sb.segstart) % sb.segsize;
+  lfs.cp.valid = 1;
+  memmove(&cp_copy, &lfs.cp, sizeof(cp_copy));
+  release(&lfs.lock);
+
+  // Write checkpoint (outside lock)
+  bp = bread(lfs.dev, sb.checkpoint0);
+  memmove(bp->data, &cp_copy, sizeof(cp_copy));
+  bwrite(bp);
   brelse(bp);
+}
+
+// Sync: flush dirty inodes, write imap, write checkpoint
+// Called when segment is full, buffer is full, or periodically
+void
+lfs_sync(void)
+{
+  // Check if there's anything to sync
+  acquire(&dirty_inodes.lock);
+  int has_dirty = (dirty_inodes.count > 0);
+  release(&dirty_inodes.lock);
+
+  if(!has_dirty)
+    return;  // Nothing to sync, avoid unnecessary imap/checkpoint writes
+
+  // 1. Flush dirty inodes to disk (updates in-memory imap)
+  lfs_flush_inodes();
+
+  // 2. Write imap to log
+  lfs_write_imap();
+
+  // 3. Write checkpoint
+  lfs_write_checkpoint();
+
+  cprintf("LFS sync: log_tail now %d\n", lfs.log_tail);
+}
+
+// Write imap to log
+static void
+lfs_write_imap(void)
+{
+  struct buf *bp;
+  uint i, j;
+  uint *p;
+  uint nblocks = (LFS_NINODES + IMAP_ENTRIES_PER_BLOCK - 1) / IMAP_ENTRIES_PER_BLOCK;
+  uint block;
+  uint imap_copy[LFS_NINODES];
+
+  // Copy imap under lock
+  acquire(&lfs.lock);
+  memmove(imap_copy, lfs.imap, sizeof(imap_copy));
+  lfs.cp.imap_nblocks = nblocks;
+  release(&lfs.lock);
+
+  for(i = 0; i < nblocks && i < NIMAP_BLOCKS; i++){
+    // Allocate block for imap
+    acquire(&lfs.lock);
+    block = lfs.log_tail++;
+    if(lfs.log_tail >= sb.size){
+      release(&lfs.lock);
+      panic("lfs_write_imap: out of disk space");
+    }
+    lfs.cp.imap_addrs[i] = block;
+    release(&lfs.lock);
+
+    // Write imap block (outside lock)
+    bp = bread(lfs.dev, block);
+    memset(bp->data, 0, BSIZE);
+    p = (uint*)bp->data;
+    for(j = 0; j < IMAP_ENTRIES_PER_BLOCK && (i * IMAP_ENTRIES_PER_BLOCK + j) < LFS_NINODES; j++){
+      p[j] = imap_copy[i * IMAP_ENTRIES_PER_BLOCK + j];
+    }
+    bwrite(bp);
+    brelse(bp);
+  }
+}
+
+// Allocate a block from the log tail
+static uint
+lfs_alloc(void)
+{
+  uint block;
+
+  acquire(&lfs.lock);
+  block = lfs.log_tail++;
+  if(lfs.log_tail >= sb.size){
+    release(&lfs.lock);
+    panic("lfs_alloc: out of disk space");
+  }
+  release(&lfs.lock);
+
+  cprintf("LFS alloc: block %d\n", block);
+  return block;
+}
+
+// Flush dirty inodes to a single block
+// Must be called before checkpoint or when buffer is full
+static void
+lfs_flush_inodes(void)
+{
+  struct buf *bp;
+  struct dinode *dip;
+  uint block;
+  int i, count;
+  struct dinode inodes_copy[IPB];
+  uint inums_copy[IPB];
+
+  // Copy data under lock
+  acquire(&dirty_inodes.lock);
+  count = dirty_inodes.count;
+  if(count == 0){
+    release(&dirty_inodes.lock);
+    return;
+  }
+  for(i = 0; i < count; i++){
+    memmove(&inodes_copy[i], &dirty_inodes.inodes[i], sizeof(struct dinode));
+    inums_copy[i] = dirty_inodes.inums[i];
+  }
+  dirty_inodes.count = 0;
+  release(&dirty_inodes.lock);
+
+  // Allocate a block for the inodes
+  cprintf("LFS flush %d inodes:", count);
+  for(i = 0; i < count; i++) cprintf(" %d", inums_copy[i]);
+  cprintf("\n");
+  block = lfs_alloc();
+
+  // Write all inodes to the block
+  bp = bread(lfs.dev, block);
+  memset(bp->data, 0, BSIZE);
+  dip = (struct dinode*)bp->data;
+  for(i = 0; i < count; i++){
+    memmove(&dip[i], &inodes_copy[i], sizeof(struct dinode));
+  }
+  bwrite(bp);
+  brelse(bp);
+
+  // Update imap with new locations
+  acquire(&lfs.lock);
+  for(i = 0; i < count; i++){
+    lfs.imap[inums_copy[i]] = IMAP_ENCODE(block, i);
+  }
+  release(&lfs.lock);
 }
 
 // Inodes.
@@ -101,67 +265,8 @@ bfree(int dev, uint b)
 // its size, the number of links referring to it, and the
 // list of blocks holding the file's content.
 //
-// The inodes are laid out sequentially on disk at
-// sb.startinode. Each inode has a number, indicating its
-// position on the disk.
-//
-// The kernel keeps a cache of in-use inodes in memory
-// to provide a place for synchronizing access
-// to inodes used by multiple processes. The cached
-// inodes include book-keeping information that is
-// not stored on disk: ip->ref and ip->valid.
-//
-// An inode and its in-memory representation go through a
-// sequence of states before they can be used by the
-// rest of the file system code.
-//
-// * Allocation: an inode is allocated if its type (on disk)
-//   is non-zero. ialloc() allocates, and iput() frees if
-//   the reference and link counts have fallen to zero.
-//
-// * Referencing in cache: an entry in the inode cache
-//   is free if ip->ref is zero. Otherwise ip->ref tracks
-//   the number of in-memory pointers to the entry (open
-//   files and current directories). iget() finds or
-//   creates a cache entry and increments its ref; iput()
-//   decrements ref.
-//
-// * Valid: the information (type, size, &c) in an inode
-//   cache entry is only correct when ip->valid is 1.
-//   ilock() reads the inode from
-//   the disk and sets ip->valid, while iput() clears
-//   ip->valid if ip->ref has fallen to zero.
-//
-// * Locked: file system code may only examine and modify
-//   the information in an inode and its content if it
-//   has first locked the inode.
-//
-// Thus a typical sequence is:
-//   ip = iget(dev, inum)
-//   ilock(ip)
-//   ... examine and modify ip->xxx ...
-//   iunlock(ip)
-//   iput(ip)
-//
-// ilock() is separate from iget() so that system calls can
-// get a long-term reference to an inode (as for an open file)
-// and only lock it for short periods (e.g., in read()).
-// The separation also helps avoid deadlock and races during
-// pathname lookup. iget() increments ip->ref so that the inode
-// stays cached and pointers to it remain valid.
-//
-// Many internal file system functions expect the caller to
-// have locked the inodes involved; this lets callers create
-// multi-step atomic operations.
-//
-// The icache.lock spin-lock protects the allocation of icache
-// entries. Since ip->ref indicates whether an entry is free,
-// and ip->dev and ip->inum indicate which i-node an entry
-// holds, one must hold icache.lock while using any of those fields.
-//
-// An ip->lock sleep-lock protects all ip-> fields other than ref,
-// dev, and inum.  One must hold ip->lock in order to
-// read or write that inode's ip->valid, ip->size, ip->type, &c.
+// In LFS, inodes are NOT at fixed locations. The imap tracks
+// where each inode is currently stored in the log.
 
 struct {
   struct spinlock lock;
@@ -172,67 +277,144 @@ void
 iinit(int dev)
 {
   int i = 0;
-  
+
   initlock(&icache.lock, "icache");
   for(i = 0; i < NINODE; i++) {
     initsleeplock(&icache.inode[i].lock, "inode");
   }
 
+  initlock(&lfs.lock, "lfs");
+  initlock(&dirty_inodes.lock, "dirty_inodes");
+  dirty_inodes.count = 0;
+  lfs.dev = dev;
+
   readsb(dev, &sb);
-  cprintf("sb: size %d nblocks %d ninodes %d nlog %d logstart %d\
- inodestart %d bmap start %d\n", sb.size, sb.nblocks,
-          sb.ninodes, sb.nlog, sb.logstart, sb.inodestart,
-          sb.bmapstart);
+
+  // Verify LFS magic
+  if(sb.magic != LFS_MAGIC){
+    panic("iinit: not an LFS filesystem");
+  }
+
+  // Read checkpoint and imap
+  lfs_read_checkpoint(dev);
+  lfs_read_imap(dev);
+
+  cprintf("LFS: size %d nsegs %d segsize %d segstart %d ninodes %d log_tail %d\n",
+          sb.size, sb.nsegs, sb.segsize, sb.segstart, sb.ninodes, lfs.log_tail);
 }
 
 static struct inode* iget(uint dev, uint inum);
 
 //PAGEBREAK!
 // Allocate an inode on device dev.
-// Mark it as allocated by  giving it type type.
+// Mark it as allocated by giving it type type.
 // Returns an unlocked but allocated and referenced inode.
+// Sprite LFS: inode is added to dirty buffer, NOT persisted immediately.
 struct inode*
 ialloc(uint dev, short type)
 {
   int inum;
-  struct buf *bp;
-  struct dinode *dip;
+  struct dinode di;
+  int need_sync = 0;
 
-  for(inum = 1; inum < sb.ninodes; inum++){
-    bp = bread(dev, IBLOCK(inum, sb));
-    dip = (struct dinode*)bp->data + inum%IPB;
-    if(dip->type == 0){  // a free inode
-      memset(dip, 0, sizeof(*dip));
-      dip->type = type;
-      log_write(bp);   // mark it allocated on the disk
-      brelse(bp);
+  // Find a free inode slot
+  acquire(&lfs.lock);
+  for(inum = 1; inum < LFS_NINODES; inum++){
+    if(lfs.imap[inum] == 0){
+      // Mark slot as used with a placeholder (0xFFFFFFFF means "in dirty buffer")
+      lfs.imap[inum] = 0xFFFFFFFF;
+      release(&lfs.lock);
+      cprintf("ialloc: inum %d type %d\n", inum, type);
+
+      // Initialize inode
+      memset(&di, 0, sizeof(di));
+      di.type = type;
+      di.nlink = 0;
+      di.size = 0;
+
+      // Add inode to dirty buffer
+      acquire(&dirty_inodes.lock);
+      if(dirty_inodes.count >= IPB){
+        // Buffer is full - sync before adding
+        release(&dirty_inodes.lock);
+        lfs_sync();
+        acquire(&dirty_inodes.lock);
+      }
+      memmove(&dirty_inodes.inodes[dirty_inodes.count], &di, sizeof(di));
+      dirty_inodes.inums[dirty_inodes.count] = inum;
+      dirty_inodes.count++;
+      if(dirty_inodes.count >= IPB){
+        need_sync = 1;
+      }
+      release(&dirty_inodes.lock);
+
+      if(need_sync){
+        lfs_sync();
+      }
+      // NO checkpoint here - Sprite LFS approach
+
       return iget(dev, inum);
     }
-    brelse(bp);
   }
+
+  release(&lfs.lock);
   panic("ialloc: no inodes");
 }
 
-// Copy a modified in-memory inode to disk.
-// Must be called after every change to an ip->xxx field
-// that lives on disk, since i-node cache is write-through.
+// Copy a modified in-memory inode to dirty buffer.
+// In LFS, inodes are buffered and flushed together when buffer is full.
+// This is the Sprite LFS approach: data first, inodes batched later.
 // Caller must hold ip->lock.
 void
 iupdate(struct inode *ip)
 {
-  struct buf *bp;
-  struct dinode *dip;
+  struct dinode di;
+  int i, found;
+  int need_sync = 0;
 
-  bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-  dip = (struct dinode*)bp->data + ip->inum%IPB;
-  dip->type = ip->type;
-  dip->major = ip->major;
-  dip->minor = ip->minor;
-  dip->nlink = ip->nlink;
-  dip->size = ip->size;
-  memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
-  log_write(bp);
-  brelse(bp);
+  // Prepare dinode
+  di.type = ip->type;
+  di.major = ip->major;
+  di.minor = ip->minor;
+  di.nlink = ip->nlink;
+  di.size = ip->size;
+  memmove(di.addrs, ip->addrs, sizeof(ip->addrs));
+
+  acquire(&dirty_inodes.lock);
+
+  // Check if this inode is already in the buffer (update in place)
+  found = 0;
+  for(i = 0; i < dirty_inodes.count; i++){
+    if(dirty_inodes.inums[i] == ip->inum){
+      memmove(&dirty_inodes.inodes[i], &di, sizeof(di));
+      found = 1;
+      break;
+    }
+  }
+
+  if(!found){
+    // Add new inode to buffer
+    if(dirty_inodes.count >= IPB){
+      // Buffer is full - sync before adding
+      release(&dirty_inodes.lock);
+      lfs_sync();
+      acquire(&dirty_inodes.lock);
+    }
+    memmove(&dirty_inodes.inodes[dirty_inodes.count], &di, sizeof(di));
+    dirty_inodes.inums[dirty_inodes.count] = ip->inum;
+    dirty_inodes.count++;
+  }
+
+  // Check if we need to sync after adding
+  if(dirty_inodes.count >= IPB){
+    need_sync = 1;
+  }
+  release(&dirty_inodes.lock);
+
+  if(need_sync){
+    lfs_sync();
+  }
+  // NO checkpoint here - Sprite LFS approach: sync only when buffer is full
 }
 
 // Find the inode with number inum on device dev
@@ -284,11 +466,16 @@ idup(struct inode *ip)
 
 // Lock the given inode.
 // Reads the inode from disk if necessary.
+// In LFS, we first check the dirty buffer, then look up in imap.
 void
 ilock(struct inode *ip)
 {
   struct buf *bp;
   struct dinode *dip;
+  uint imap_entry;
+  uint block;
+  uint slot;
+  int i, found;
 
   if(ip == 0 || ip->ref < 1)
     panic("ilock");
@@ -296,15 +483,55 @@ ilock(struct inode *ip)
   acquiresleep(&ip->lock);
 
   if(ip->valid == 0){
-    bp = bread(ip->dev, IBLOCK(ip->inum, sb));
-    dip = (struct dinode*)bp->data + ip->inum%IPB;
-    ip->type = dip->type;
-    ip->major = dip->major;
-    ip->minor = dip->minor;
-    ip->nlink = dip->nlink;
-    ip->size = dip->size;
-    memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
-    brelse(bp);
+    // First check if inode is in dirty buffer
+    found = 0;
+    acquire(&dirty_inodes.lock);
+    for(i = 0; i < dirty_inodes.count; i++){
+      if(dirty_inodes.inums[i] == ip->inum){
+        // Found in dirty buffer - copy from there
+        dip = &dirty_inodes.inodes[i];
+        ip->type = dip->type;
+        ip->major = dip->major;
+        ip->minor = dip->minor;
+        ip->nlink = dip->nlink;
+        ip->size = dip->size;
+        memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
+        found = 1;
+        break;
+      }
+    }
+    release(&dirty_inodes.lock);
+
+    if(!found){
+      // Look up inode location in imap
+      acquire(&lfs.lock);
+      imap_entry = lfs.imap[ip->inum];
+      release(&lfs.lock);
+
+      if(imap_entry == 0){
+        cprintf("ilock: inum %d not in imap\n", ip->inum);
+        panic("ilock: inode not in imap");
+      }
+
+      // Check for placeholder (inode should be in dirty buffer but wasn't found)
+      if(imap_entry == 0xFFFFFFFF)
+        panic("ilock: inode marked in-flight but not in dirty buffer");
+
+      // Decode block address and slot from imap entry
+      block = IMAP_BLOCK(imap_entry);
+      slot = IMAP_SLOT(imap_entry);
+
+      bp = bread(ip->dev, block);
+      dip = (struct dinode*)bp->data + slot;
+      ip->type = dip->type;
+      ip->major = dip->major;
+      ip->minor = dip->minor;
+      ip->nlink = dip->nlink;
+      ip->size = dip->size;
+      memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
+      brelse(bp);
+    }
+
     ip->valid = 1;
     if(ip->type == 0)
       panic("ilock: no type");
@@ -326,11 +553,11 @@ iunlock(struct inode *ip)
 // be recycled.
 // If that was the last reference and the inode has no links
 // to it, free the inode (and its content) on disk.
-// All calls to iput() must be inside a transaction in
-// case it has to free the inode.
 void
 iput(struct inode *ip)
 {
+  int i;
+
   acquiresleep(&ip->lock);
   if(ip->valid && ip->nlink == 0){
     acquire(&icache.lock);
@@ -340,7 +567,30 @@ iput(struct inode *ip)
       // inode has no links and no other references: truncate and free.
       itrunc(ip);
       ip->type = 0;
-      iupdate(ip);
+
+      // Remove inode from dirty buffer if present (don't need to persist type=0)
+      acquire(&dirty_inodes.lock);
+      for(i = 0; i < dirty_inodes.count; i++){
+        if(dirty_inodes.inums[i] == ip->inum){
+          // Remove by shifting remaining entries
+          for(; i < dirty_inodes.count - 1; i++){
+            memmove(&dirty_inodes.inodes[i], &dirty_inodes.inodes[i+1], sizeof(struct dinode));
+            dirty_inodes.inums[i] = dirty_inodes.inums[i+1];
+          }
+          dirty_inodes.count--;
+          break;
+        }
+      }
+      release(&dirty_inodes.lock);
+
+      // Mark inode as free in imap
+      acquire(&lfs.lock);
+      lfs.imap[ip->inum] = 0;
+      release(&lfs.lock);
+
+      // Sync to persist the freed inode slot
+      lfs_sync();
+
       ip->valid = 0;
     }
   }
@@ -369,6 +619,7 @@ iunlockput(struct inode *ip)
 
 // Return the disk block address of the nth block in inode ip.
 // If there is no such block, bmap allocates one.
+// In LFS, new blocks are allocated from the log tail.
 static uint
 bmap(struct inode *ip, uint bn)
 {
@@ -376,8 +627,10 @@ bmap(struct inode *ip, uint bn)
   struct buf *bp;
 
   if(bn < NDIRECT){
-    if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
+    if((addr = ip->addrs[bn]) == 0){
+      ip->addrs[bn] = addr = lfs_alloc();
+      cprintf("  bmap: inum %d bn %d -> block %d\n", ip->inum, bn, addr);
+    }
     return addr;
   }
   bn -= NDIRECT;
@@ -385,12 +638,12 @@ bmap(struct inode *ip, uint bn)
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
+      ip->addrs[NDIRECT] = addr = lfs_alloc();
     bp = bread(ip->dev, addr);
     a = (uint*)bp->data;
     if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+      a[bn] = addr = lfs_alloc();
+      bwrite(bp);
     }
     brelse(bp);
     return addr;
@@ -400,10 +653,7 @@ bmap(struct inode *ip, uint bn)
 }
 
 // Truncate inode (discard contents).
-// Only called when the inode has no links
-// to it (no directory entries referring to it)
-// and has no in-memory reference to it (is
-// not an open file or current directory).
+// In LFS without GC, we don't actually free blocks - just clear the references.
 static void
 itrunc(struct inode *ip)
 {
@@ -411,22 +661,19 @@ itrunc(struct inode *ip)
   struct buf *bp;
   uint *a;
 
+  // Clear direct blocks (don't free - no GC)
   for(i = 0; i < NDIRECT; i++){
-    if(ip->addrs[i]){
-      bfree(ip->dev, ip->addrs[i]);
-      ip->addrs[i] = 0;
-    }
+    ip->addrs[i] = 0;
   }
 
+  // Clear indirect block
   if(ip->addrs[NDIRECT]){
     bp = bread(ip->dev, ip->addrs[NDIRECT]);
     a = (uint*)bp->data;
     for(j = 0; j < NINDIRECT; j++){
-      if(a[j])
-        bfree(ip->dev, a[j]);
+      a[j] = 0;
     }
     brelse(bp);
-    bfree(ip->dev, ip->addrs[NDIRECT]);
     ip->addrs[NDIRECT] = 0;
   }
 
@@ -478,6 +725,7 @@ readi(struct inode *ip, char *dst, uint off, uint n)
 // PAGEBREAK!
 // Write data to inode.
 // Caller must hold ip->lock.
+// In LFS, data blocks are written to the log.
 int
 writei(struct inode *ip, char *src, uint off, uint n)
 {
@@ -499,14 +747,17 @@ writei(struct inode *ip, char *src, uint off, uint n)
     bp = bread(ip->dev, bmap(ip, off/BSIZE));
     m = min(n - tot, BSIZE - off%BSIZE);
     memmove(bp->data + off%BSIZE, src, m);
-    log_write(bp);
+    bwrite(bp);
     brelse(bp);
   }
 
   if(n > 0 && off > ip->size){
     ip->size = off;
-    iupdate(ip);
   }
+
+  // Update inode in log (writes new inode, imap, checkpoint)
+  iupdate(ip);
+
   return n;
 }
 
@@ -620,7 +871,6 @@ skipelem(char *path, char *name)
 // Look up and return the inode for a path name.
 // If parent != 0, return the inode for the parent and copy the final
 // path element into name, which must have room for DIRSIZ bytes.
-// Must be called inside a transaction since it calls iput().
 static struct inode*
 namex(char *path, int nameiparent, char *name)
 {

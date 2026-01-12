@@ -10,5 +10,10 @@
 #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
 #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
 #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
-#define FSSIZE       1000  // size of file system in blocks
+#define FSSIZE       50000  // size of file system in blocks (increased for LFS overhead)
+
+// LFS parameters
+#define LFS_NINODES   200  // maximum number of inodes in LFS
+#define LFS_SEGSIZE   64   // segment size in blocks
+#define LFS_SEGSTART  4    // first segment starts at block 4 (after boot, sb, cp0, cp1)
 

@@ -106,11 +106,19 @@ cprintf(char *fmt, ...)
 void
 panic(char *s)
 {
+  static int syncing = 0;  // Prevent recursive sync
   int i;
   uint pcs[10];
 
   cli();
   cons.locking = 0;
+
+  // LFS: Try to sync before halting (if not already syncing)
+  if(!syncing && !panicked){
+    syncing = 1;
+    lfs_sync();
+  }
+
   // use lapiccpunum so that we can call panic from mycpu()
   cprintf("lapicid %d: panic: ", lapicid());
   cprintf(s);
