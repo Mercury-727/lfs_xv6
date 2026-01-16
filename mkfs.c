@@ -260,8 +260,9 @@ lfs_flush_inodes(void)
   dip = (struct dinode*)buf;
   for(i = 0; i < dirty_count; i++){
     memmove(&dip[i], &dirty_inodes[i], sizeof(struct dinode));
-    // Update imap with encoded value (block << 3 | slot)
-    imap[dirty_inums[i]] = IMAP_ENCODE(block, i);
+    // Update imap with encoded value (block << 12 | version << 4 | slot)
+    // version starts at 0 for newly created inodes
+    imap[dirty_inums[i]] = IMAP_ENCODE(block, 0, i);
   }
   wsect(block, buf);
 

@@ -2,7 +2,7 @@
 // Both the kernel and user programs use this header file.
 
 #define ROOTINO 1  // root i-number
-#define BSIZE 512  // block size
+#define BSIZE 1024  // block size
 
 // LFS Magic number
 #define LFS_MAGIC 0x4C465321  // "LFS!"
@@ -39,13 +39,19 @@ struct checkpoint {
 // Imap entries per block
 #define IMAP_ENTRIES_PER_BLOCK (BSIZE / sizeof(uint))
 
-// Imap entry encoding: block address + slot index
-// imap[inum] = (block_addr << 3) | slot_index
-// slot_index: 0-7 (3 bits), block_addr: remaining bits
-#define IMAP_SLOT_BITS 3
-#define IMAP_SLOT_MASK ((1 << IMAP_SLOT_BITS) - 1)  // 0x7
-#define IMAP_ENCODE(block, slot) (((block) << IMAP_SLOT_BITS) | ((slot) & IMAP_SLOT_MASK))
-#define IMAP_BLOCK(entry) ((entry) >> IMAP_SLOT_BITS)
+// Imap entry encoding: block address + version + slot index
+// imap[inum] = (block_addr << 12) | (version << 4) | slot_index
+// slot_index: 0-15 (4 bits), version: 0-255 (8 bits), block_addr: remaining 20 bits
+#define IMAP_SLOT_BITS 4
+#define IMAP_VERSION_BITS 8
+#define IMAP_SLOT_MASK ((1 << IMAP_SLOT_BITS) - 1)  // 0xF
+#define IMAP_VERSION_MASK ((1 << IMAP_VERSION_BITS) - 1)  // 0xFF
+#define IMAP_ENCODE(block, version, slot) \
+  (((block) << (IMAP_VERSION_BITS + IMAP_SLOT_BITS)) | \
+   (((version) & IMAP_VERSION_MASK) << IMAP_SLOT_BITS) | \
+   ((slot) & IMAP_SLOT_MASK))
+#define IMAP_BLOCK(entry) ((entry) >> (IMAP_VERSION_BITS + IMAP_SLOT_BITS))
+#define IMAP_VERSION(entry) (((entry) >> IMAP_SLOT_BITS) & IMAP_VERSION_MASK)
 #define IMAP_SLOT(entry) ((entry) & IMAP_SLOT_MASK)
 
 #define NDIRECT 12

@@ -250,10 +250,12 @@ lfs_flush_inodes(void)
   bwrite(bp);
   brelse(bp);
 
-  // Update imap with new locations
+  // Update imap with new locations (version starts at 0)
   acquire(&lfs.lock);
   for(i = 0; i < count; i++){
-    lfs.imap[inums_copy[i]] = IMAP_ENCODE(block, i);
+    uint old_entry = lfs.imap[inums_copy[i]];
+    uint new_version = (old_entry == 0 || old_entry == 0xFFFFFFFF) ? 0 : (IMAP_VERSION(old_entry) + 1) & IMAP_VERSION_MASK;
+    lfs.imap[inums_copy[i]] = IMAP_ENCODE(block, new_version, i);
   }
   release(&lfs.lock);
 }

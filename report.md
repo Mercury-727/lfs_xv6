@@ -308,6 +308,9 @@ ALL TESTS PASSED
 #define IMAP_SLOT(entry) ((entry) & IMAP_SLOT_MASK)
 ```
 
+### 9.3 Imap Entry 하나로 Inode 블럭 자체를 가리킨다면?
+- inode 8, inode 100 
+
 #### Dirty Inode 버퍼 (fs.c)
 ```c
 struct {
@@ -346,7 +349,7 @@ void iupdate(struct inode *ip) {
   //    └── 이미 버퍼에 있으면 갱신
   //    └── 버퍼가 가득 차면 (8개) lfs_sync() 호출
 
-  // 2. sync 없음! (Sprite LFS 방식)
+  // 2. sync 없음 (Sprite LFS 방식)
   //    checkpoint는 버퍼가 가득 찼을 때만 기록
 }
 ```
@@ -392,15 +395,15 @@ Sprite LFS 방식에서는 dirty inode 버퍼가 가득 찼을 때만 sync가 �
 | 조건 | 설명 | 파일 |
 |------|------|------|
 | **버퍼 Full** | dirty_inodes 버퍼가 8개 가득 찼을 때 | fs.c |
-| **주기적 Sync** | 약 30초마다 (3000 ticks) | trap.c |
+| **주기적 Sync** | 약 1초마다 (100 ticks) | trap.c |
 | **Shutdown Sync** | panic() 호출 시 시스템 중단 전 | console.c |
 
 ### 10.3 주기적 Sync (trap.c)
-타이머 인터럽트를 이용하여 약 30초마다 lfs_sync() 호출:
+타이머 인터럽트를 이용하여 약 1초마다 lfs_sync() 호출:
 
 ```c
 // trap.c
-#define LFS_SYNC_INTERVAL 3000  // Sync every 3000 ticks (~30 seconds)
+#define LFS_SYNC_INTERVAL 100  // Sync every 100 ticks (~1 seconds)
 static uint last_sync_tick = 0;
 
 void trap(struct trapframe *tf) {
@@ -462,12 +465,27 @@ void lfs_sync(void) {
                         ↓ Yes
                     lfs_sync()
 
-주기적 Sync (30초):
+주기적 Sync (1초):
   타이머 인터럽트 → trap() → lfs_sync()
 
 Shutdown Sync:
   panic() → lfs_sync() → halt
 ```
+
+### 10.7 문제 상황
+1. echo hello > test1.txt
+   - inum 18 할당 → dirty_inodes 버퍼에 추가
+   - 디렉토리 엔트리 "test1.txt" -> 18 추가 (디스크에 기록됨!)
+   - 하지만 imap/checkpoint는 아직 sync 안 됨
+
+2. QEMU 종료
+   - imap[18] = 디스크에 저장 안 됨
+
+3. 재부팅
+   - 디렉토리에는 test1.txt (inum 18) 존재
+   - 하지만 imap[18] = 0
+   - panic!
+
 
 ---
 
@@ -488,33 +506,8 @@ Shutdown Sync:
 
 ---
 
-## 12. 실행 방법
 
-### 12.1 빌드
-```bash
-make clean
-make
-```
-
-### 12.2 QEMU 실행
-```bash
-make qemu-nox
-```
-
-### 12.3 테스트
-```bash
-# xv6 쉘에서
-$ ls
-$ cat README
-$ echo hello > test.txt
-$ cat test.txt
-$ usertests -q
-```
-
----
-
-## 13. 참고 자료
+## 12. 참고 자료
 
 - Sprite LFS 논문: "The Design and Implementation of a Log-Structured File System" (Rosenblum & Ousterhout, 1992)
-- xv6 문서: https://pdos.csail.mit.edu/6.828/
 - xv6 소스코드: https://github.com/mit-pdos/xv6-public
