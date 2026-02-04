@@ -10,10 +10,15 @@
 #define MAXOPBLOCKS  10  // max # of blocks any FS op writes
 #define LOGSIZE      (MAXOPBLOCKS*3)  // max data blocks in on-disk log
 #define NBUF         (MAXOPBLOCKS*3)  // size of disk block cache
-#define FSSIZE       50000  // size of file system in blocks (increased for LFS overhead)
+#define FSSIZE       20000  // size of file system in blocks (increased for LFS overhead)
 
 // LFS parameters
 #define LFS_NINODES   200  // maximum number of inodes in LFS
-#define LFS_SEGSIZE   64   // segment size in blocks
+#define LFS_SEGSIZE   32   // segment size in blocks (reduced to fit SSB)
 #define LFS_SEGSTART  4    // first segment starts at block 4 (after boot, sb, cp0, cp1)
+
+// GC parameters
+#define GC_THRESHOLD      30   // GC trigger threshold (disk usage %) - trigger early
+#define GC_TARGET_SEGS    8    // Number of segments to clean per GC run
+#define GC_UTIL_THRESHOLD 95   // Max utilization to consider for cleaning (%)
 

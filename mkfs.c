@@ -33,9 +33,16 @@ struct dinode dirty_inodes[IPB];
 uint dirty_inums[IPB];
 int dirty_count = 0;
 
+// SSB (Segment Summary Block) buffer
+struct ssb_entry ssb_buf[SSB_ENTRIES_PER_BLOCK];
+int ssb_count = 0;
+uint ssb_seg_start;  // Start of current segment
+
 void wsect(uint, void*);
 void rsect(uint sec, void *buf);
+uint lfs_alloc_with_ssb(uchar type, uint inum, uint offset, uint version);
 uint lfs_alloc(void);
+void lfs_flush_ssb(void);
 void lfs_flush_inodes(void);
 void lfs_write_inode(uint inum, struct dinode *dip);
 void lfs_write_imap(void);
@@ -106,6 +113,7 @@ main(int argc, char *argv[])
 
   // Initialize log tail to start of log area
   log_tail = LFS_SEGSTART;
+  ssb_seg_start = LFS_SEGSTART;
 
   // Initialize imap (all zeros = no inodes allocated)
   memset(imap, 0, sizeof(imap));
@@ -229,17 +237,92 @@ rsect(uint sec, void *buf)
   }
 }
 
-// Allocate a block from the log tail
-uint
-lfs_alloc(void)
+// Compute SSB checksum (must match fs.c gc_compute_checksum)
+static uint
+ssb_checksum(struct ssb_entry *entries, int count)
 {
-  uint block = log_tail;
-  log_tail++;
+  uint checksum = 0;
+  int i;
+  uint *p;
+
+  for(i = 0; i < count; i++){
+    p = (uint*)&entries[i];
+    checksum ^= p[0] ^ p[1] ^ p[2];  // XOR first 3 uints of structure
+  }
+  return checksum;
+}
+
+// Flush SSB buffer to disk
+void
+lfs_flush_ssb(void)
+{
+  if(ssb_count == 0)
+    return;
+
+  char buf[BSIZE];
+  struct ssb *ssb_ptr;
+  uint block = log_tail++;
+
+  if(log_tail >= FSSIZE){
+    fprintf(stderr, "lfs_flush_ssb: out of disk space\n");
+    exit(1);
+  }
+
+  memset(buf, 0, BSIZE);
+  ssb_ptr = (struct ssb *)buf;
+  ssb_ptr->magic = xint(SSB_MAGIC);
+  ssb_ptr->nblocks = xint(ssb_count);
+
+  // Copy entries first (convert to little-endian / disk format)
+  for(int i = 0; i < ssb_count; i++){
+    ssb_ptr->entries[i].type = ssb_buf[i].type;
+    ssb_ptr->entries[i].inum = xint(ssb_buf[i].inum);
+    ssb_ptr->entries[i].offset = xint(ssb_buf[i].offset);
+    ssb_ptr->entries[i].version = xint(ssb_buf[i].version);
+  }
+
+  // Compute checksum on disk-format entries (must match fs.c gc_verify_checksum)
+  ssb_ptr->checksum = ssb_checksum(ssb_ptr->entries, ssb_count);
+
+  wsect(block, buf);
+  ssb_count = 0;
+}
+
+// Allocate a block with SSB entry
+uint
+lfs_alloc_with_ssb(uchar type, uint inum, uint offset, uint version)
+{
+  // Check if we need to flush SSB (segment boundary or buffer full)
+  uint seg_offset = (log_tail - LFS_SEGSTART) % LFS_SEGSIZE;
+
+  // Reserve 1 block at end of segment for SSB
+  if(seg_offset >= LFS_SEGSIZE - 1 || ssb_count >= SSB_ENTRIES_PER_BLOCK - 1){
+    lfs_flush_ssb();
+  }
+
+  uint block = log_tail++;
   if(log_tail >= FSSIZE){
     fprintf(stderr, "lfs_alloc: out of disk space\n");
     exit(1);
   }
+
+  // Add SSB entry if type is specified
+  if(type != 0){
+    ssb_buf[ssb_count].type = type;
+    ssb_buf[ssb_count].inum = inum;
+    ssb_buf[ssb_count].offset = offset;
+    ssb_buf[ssb_count].version = version;
+    ssb_count++;
+  }
+
   return block;
+}
+
+// Allocate a block from the log tail (legacy, no SSB)
+uint
+lfs_alloc(void)
+{
+  return lfs_alloc_with_ssb(0, 0, 0, 0);
 }
 
 // Flush dirty inodes to a single block
@@ -254,7 +337,8 @@ lfs_flush_inodes(void)
   if(dirty_count == 0)
     return;
 
-  block = lfs_alloc();
+  // Allocate inode block with SSB entry (first inum in the block)
+  block = lfs_alloc_with_ssb(SSB_TYPE_INODE, dirty_inums[0], 0, 0);
 
   memset(buf, 0, BSIZE);
   dip = (struct dinode*)buf;
@@ -323,8 +407,14 @@ lfs_write_checkpoint(void)
 {
   char buf[BSIZE];
 
-  // Flush any pending dirty inodes first
+  // Flush any pending SSB entries first
+  lfs_flush_ssb();
+
+  // Flush any pending dirty inodes
   lfs_flush_inodes();
+
+  // Flush SSB again (for inode block SSB entry)
+  lfs_flush_ssb();
 
   // Write imap (after flush, so addresses are correct)
   lfs_write_imap();
@@ -410,19 +500,22 @@ iappend(uint inum, void *xp, int n)
 
     if(fbn < NDIRECT){
       if(xint(din.addrs[fbn]) == 0){
-        din.addrs[fbn] = xint(lfs_alloc());
+        // Allocate direct data block with SSB entry (version 0 for mkfs)
+        din.addrs[fbn] = xint(lfs_alloc_with_ssb(SSB_TYPE_DATA, inum, fbn, 0));
       }
       x = xint(din.addrs[fbn]);
     } else {
       if(xint(din.addrs[NDIRECT]) == 0){
-        din.addrs[NDIRECT] = xint(lfs_alloc());
+        // Allocate indirect block with SSB entry
+        din.addrs[NDIRECT] = xint(lfs_alloc_with_ssb(SSB_TYPE_INDIRECT, inum, NDIRECT, 0));
         // Zero out indirect block
         memset(indirect, 0, sizeof(indirect));
         wsect(xint(din.addrs[NDIRECT]), indirect);
       }
       rsect(xint(din.addrs[NDIRECT]), (char*)indirect);
       if(indirect[fbn - NDIRECT] == 0){
-        indirect[fbn - NDIRECT] = xint(lfs_alloc());
+        // Allocate indirect data block with SSB entry
+        indirect[fbn - NDIRECT] = xint(lfs_alloc_with_ssb(SSB_TYPE_DATA, inum, fbn, 0));
         wsect(xint(din.addrs[NDIRECT]), (char*)indirect);
       }
       x = xint(indirect[fbn-NDIRECT]);

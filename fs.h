@@ -24,6 +24,43 @@ struct superblock {
 
 // Maximum imap blocks (each block holds 128 inode locations)
 #define NIMAP_BLOCKS 4
+ 
+// Maximum SUT blocks
+#define NSUT_BLOCKS 4
+#define LFS_NSEGS_MAX 1000
+
+// Block types for SSB (must be non-zero, 0 means no SSB entry)
+#define SSB_TYPE_DATA     1
+#define SSB_TYPE_INODE    2
+#define SSB_TYPE_INDIRECT 3
+
+// Segment Summary Block Entry
+struct ssb_entry {
+  uchar type;    // Block type
+  uint inum;     // Inode number (or start inum for INODE block)
+  uint offset;   // Block offset within the file
+  uint version;  // Inode version
+};
+
+// SSB Magic number for identification
+#define SSB_MAGIC 0x53534221  // "SSB!"
+
+// SSB entries per block: (BSIZE - 12) / 16 (approx aligned size) = 63 entries
+#define SSB_ENTRIES_PER_BLOCK ((BSIZE - 3*sizeof(uint)) / sizeof(struct ssb_entry))
+
+// Segment Summary Block (on-disk format with header)
+struct ssb {
+  uint magic;       // SSB_MAGIC - SSB block identification
+  uint nblocks;     // Number of data blocks this SSB describes
+  uint checksum;    // Checksum of entries for integrity verification
+  struct ssb_entry entries[SSB_ENTRIES_PER_BLOCK];
+};
+
+// Segment Usage Table Entry
+struct sut_entry {
+  uint live_bytes;
+  uint age;      // Last modification time (ticks or sequence)
+};
 
 // Checkpoint structure - stored at fixed location
 struct checkpoint {
@@ -33,6 +70,8 @@ struct checkpoint {
   uint seg_offset;                   // Offset within current segment
   uint imap_addrs[NIMAP_BLOCKS];     // Disk addresses of imap blocks
   uint imap_nblocks;                 // Number of imap blocks in use
+  uint sut_addrs[NSUT_BLOCKS];       // Disk addresses of SUT blocks
+  uint sut_nblocks;                  // Number of SUT blocks in use
   uint valid;                        // Is this checkpoint valid?
 };
 
