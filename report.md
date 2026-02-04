@@ -6,12 +6,12 @@
 xv6 운영체제에 Sprite LFS (Log-structured File System)를 구현한다.
 
 ### 1.2 설계 제약사항
-- **GC (Garbage Collection) 미구현**: 로그가 디스크 끝에 도달하면 더 이상 쓰기 불가
+- **GC (Garbage Collection) 구현 완료**: Cost-benefit 정책 기반 세그먼트 클리닝
 - **Crash-Safety 미구현**: 단일 checkpoint 사용 (교대 사용 안 함)
 - **기존 inode 구조체 유지**: xv6의 `struct dinode` 그대로 사용
 
 ### 1.3 핵심 설계 결정
-- **Segment 단위 로그 관리**: 64 블록 단위 세그먼트
+- **Segment 단위 로그 관리**: 32 블록 단위 세그먼트
 - **Imap 로그 방식**: imap도 로그에 순차 기록 (checkpoint만 고정 위치)
 - **매 쓰기마다 checkpoint 갱신**: 안정성 우선
 
@@ -30,14 +30,14 @@ xv6 운영체제에 Sprite LFS (Log-structured File System)를 구현한다.
    0      1          2             3           4 ~ FSSIZE-1
 ```
 
-### 2.3 블록 배치 (FSSIZE = 50000)
+### 2.3 블록 배치 (FSSIZE = 20000)
 | 영역 | 블록 번호 | 크기 | 설명 |
 |------|----------|------|------|
 | Boot | 0 | 1 | 부트 로더 |
 | Superblock | 1 | 1 | 파일 시스템 메타데이터 |
 | Checkpoint 0 | 2 | 1 | 현재 checkpoint |
 | Checkpoint 1 | 3 | 1 | 예비 (미사용) |
-| Log | 4-49999 | 49996 | 세그먼트들 (781개) |
+| Log | 4-19999 | 19996 | 세그먼트들 (624개, 각 32블록) |
 
 ---
 
@@ -66,24 +66,54 @@ struct checkpoint {
   uint seg_offset;                   // 세그먼트 내 오프셋
   uint imap_addrs[NIMAP_BLOCKS];     // imap 블록들의 디스크 위치
   uint imap_nblocks;                 // 사용 중인 imap 블록 수
+  uint sut_addrs[NSUT_BLOCKS];       // SUT 블록들의 디스크 위치 (GC용)
+  uint sut_nblocks;                  // 사용 중인 SUT 블록 수
   uint valid;                        // 유효성 플래그
 };
 ```
 
 ### 3.3 Imap
-- **구조**: `imap[inum] = disk_block_address`
+- **구조**: `imap[inum] = IMAP_ENCODE(block, version, slot)`
+  - `block`: inode가 저장된 디스크 블록 주소 (20비트)
+  - `version`: inode 버전 - GC staleness 감지용 (8비트)
+  - `slot`: 블록 내 inode 위치 0~15 (4비트)
 - **크기**: 200개 inode 지원 (LFS_NINODES)
-- **블록당 엔트리**: 128개 (BSIZE / sizeof(uint))
-- **총 imap 블록 수**: 2개
+- **블록당 엔트리**: 256개 (BSIZE / sizeof(uint))
+- **총 imap 블록 수**: 최대 4개 (NIMAP_BLOCKS)
 
 ### 3.4 LFS 런타임 상태 (fs.c)
 ```c
 struct {
   struct spinlock lock;
-  uint imap[LFS_NINODES];      // inode 번호 -> 디스크 블록 주소
+  uint imap[LFS_NINODES];      // inode 번호 -> IMAP_ENCODE(block, version, slot)
   struct checkpoint cp;        // 현재 checkpoint
   uint log_tail;               // 다음 쓰기 위치
+  uint cur_seg_end;            // 현재 할당 가능 영역의 끝
   int dev;                     // 장치 번호
+  int syncing;                 // 재귀 호출 방지 플래그
+
+  // GC / SUT 상태
+  struct sut_entry sut[LFS_NSEGS_MAX];   // Segment Usage Table
+  struct ssb_entry ssb_buf[SSB_ENTRIES_PER_BLOCK]; // SSB 엔트리 버퍼
+  uint ssb_count;              // SSB 버퍼 내 엔트리 수
+  uint ssb_seg_start;          // SSB 엔트리가 속한 세그먼트 시작 블록
+  int ssb_flushing;            // SSB flush 진행 중 플래그
+  struct ssb_entry ssb_flush_buf[SSB_ENTRIES_PER_BLOCK]; // flush용 별도 버퍼
+  uint ssb_pending_block;      // alloc 후 기록할 pending SSB 블록
+  uint reserved_ssb_block;     // 세그먼트 끝에 예약된 SSB 블록
+  int ssb_pending_count;       // pending SSB 엔트리 수
+
+  // GC 프리 세그먼트 리스트 (순환 버퍼)
+  uint free_segs[LFS_NSEGS_MAX];  // 프리 세그먼트 인덱스
+  int free_head;                  // 순환 버퍼 head
+  int free_tail;                  // 순환 버퍼 tail
+  int free_count;                 // 프리 세그먼트 수
+  int gc_running;                 // GC 재진입 방지
+  int gc_failed;                  // GC 실패 플래그
+
+  // Pending 프리 세그먼트 (checkpoint sync 대기)
+  uint pending_free_segs[GC_TARGET_SEGS];
+  int pending_free_count;
 } lfs;
 ```
 
@@ -99,10 +129,15 @@ struct {
 
 ### 4.2 param.h
 ```c
-#define FSSIZE       50000  // 파일 시스템 크기 (블록)
+#define FSSIZE       20000  // 파일 시스템 크기 (블록)
 #define LFS_NINODES   200   // 최대 inode 수
-#define LFS_SEGSIZE   64    // 세그먼트 크기 (블록)
+#define LFS_SEGSIZE   32    // 세그먼트 크기 (블록)
 #define LFS_SEGSTART  4     // 로그 시작 블록
+
+// GC 파라미터
+#define GC_THRESHOLD      30   // GC 트리거 임계값 (%)
+#define GC_TARGET_SEGS    8    // GC 1회당 클리닝할 세그먼트 수
+#define GC_UTIL_THRESHOLD 95   // 클리닝 대상 최대 활용률 (%)
 ```
 
 ### 4.3 fs.c (핵심 변경)
@@ -111,7 +146,7 @@ struct {
 | 함수 | 이유 |
 |------|------|
 | `balloc()` | 비트맵 기반 할당 → `lfs_alloc()` 대체 |
-| `bfree()` | GC 미구현으로 불필요 |
+| `bfree()` | LFS는 GC가 세그먼트 단위로 회수하므로 개별 블록 해제 불필요 |
 
 #### 추가된 함수
 | 함수 | 역할 |
@@ -121,6 +156,12 @@ struct {
 | `lfs_write_checkpoint()` | checkpoint를 고정 위치에 기록 |
 | `lfs_write_imap()` | imap 블록들을 로그에 기록 |
 | `lfs_alloc()` | 로그 tail에서 블록 할당 |
+| `lfs_sync()` | dirty inodes + SSB + SUT + imap + checkpoint 기록 |
+| `lfs_gc()` | Garbage Collection 메인 함수 |
+| `gc_select_victims()` | cost-benefit 정책으로 victim 세그먼트 선택 |
+| `gc_clean_segment()` | 세그먼트 클리닝 (SSB 파싱 + 블록 재배치) |
+| `gc_relocate_block()` | 데이터/indirect 블록 재배치 |
+| `gc_relocate_inode_block()` | inode 블록 재배치 |
 
 #### 수정된 함수
 | 함수 | 변경 내용 |
@@ -132,7 +173,7 @@ struct {
 | `iput()` | inode 해제 시 imap에서 제거 |
 | `bmap()` | 블록 할당 시 `lfs_alloc()` 사용 |
 | `writei()` | 데이터 기록 후 `iupdate()` 호출 |
-| `itrunc()` | 블록 해제 없이 참조만 제거 (GC 없음) |
+| `itrunc()` | 블록 해제 없이 참조만 제거 (GC가 세그먼트 단위로 회수) |
 
 ### 4.4 log.c
 기존 WAL (Write-Ahead Logging) 제거, 호환성을 위한 no-op 함수 유지:
@@ -270,10 +311,11 @@ ALL TESTS PASSED
 
 ## 8. 제한사항
 
-### 8.1 GC 미구현
-- 삭제된 파일의 블록이 회수되지 않음
-- 로그가 디스크 끝에 도달하면 "out of disk space" panic
-- 해결: FSSIZE를 충분히 크게 설정 (현재 50000 블록 = 25MB)
+### 8.1 GC 구현 완료
+- ~~GC 미구현~~ → Cost-benefit 정책 기반 GC 구현 완료
+- 삭제된 파일의 블록이 GC에 의해 자동 회수됨
+- SSB (Segment Summary Block) 기반 live 블록 감지
+- 자세한 내용은 섹션 12 참조
 
 ### 8.2 Crash-Safety 미구현
 - 단일 checkpoint 사용
@@ -281,43 +323,52 @@ ALL TESTS PASSED
 - 해결: checkpoint 교대 사용 구현 필요
 
 ### 8.3 성능 오버헤드
-- 매 쓰기마다 imap + checkpoint 기록
+- 매 sync마다 imap + checkpoint 기록
 - 작은 쓰기에도 여러 블록 사용
-- **해결: 아이노드 버퍼링 최적화 적용 (아래 참조)**
+- **해결: 아이노드 버퍼링 최적화 적용 (섹션 9 참조)**
+- **해결: SSB 버퍼링으로 메타데이터 쓰기 최소화**
 
 ---
 
-## 9. 아이노드 버퍼링 최적화 (IPB = 8)
+## 9. 아이노드 버퍼링 최적화 (IPB = 16)
 
 ### 9.1 문제점
-기존 구현에서는 inode 하나당 한 블록(512B)을 사용하여 공간 낭비가 심했음.
+기존 구현에서는 inode 하나당 한 블록을 사용하여 공간 낭비가 심했음.
 - dinode 크기: 64 바이트
-- 블록 크기: 512 바이트
-- 낭비: 512 - 64 = 448 바이트/inode
+- 블록 크기: 1024 바이트 (BSIZE)
+- 낭비: 1024 - 64 = 960 바이트/inode
 
-### 9.2 해결책: 8개 inode를 하나의 블록에 저장
+### 9.2 해결책: 16개 inode를 하나의 블록에 저장
 
-#### imap 인코딩 (fs.h)
+#### imap 인코딩 (fs.h) - GC 버전 지원 포함
 ```c
-// imap[inum] = (block_addr << 3) | slot_index
-// slot_index: 0-7 (3 bits)
-#define IMAP_SLOT_BITS 3
-#define IMAP_SLOT_MASK ((1 << IMAP_SLOT_BITS) - 1)  // 0x7
-#define IMAP_ENCODE(block, slot) (((block) << IMAP_SLOT_BITS) | ((slot) & IMAP_SLOT_MASK))
-#define IMAP_BLOCK(entry) ((entry) >> IMAP_SLOT_BITS)
-#define IMAP_SLOT(entry) ((entry) & IMAP_SLOT_MASK)
+// imap[inum] = (block_addr << 12) | (version << 4) | slot_index
+// slot_index: 0-15 (4 bits), version: 0-255 (8 bits)
+#define IMAP_SLOT_BITS 4
+#define IMAP_VERSION_BITS 8
+#define IMAP_SLOT_MASK ((1 << IMAP_SLOT_BITS) - 1)  // 0xF
+#define IMAP_VERSION_MASK ((1 << IMAP_VERSION_BITS) - 1)  // 0xFF
+#define IMAP_ENCODE(block, version, slot) \
+  (((block) << 12) | (((version) & 0xFF) << 4) | ((slot) & 0xF))
+#define IMAP_BLOCK(entry)   ((entry) >> 12)
+#define IMAP_VERSION(entry) (((entry) >> 4) & 0xFF)
+#define IMAP_SLOT(entry)    ((entry) & 0xF)
 ```
-
-### 9.3 Imap Entry 하나로 Inode 블럭 자체를 가리킨다면?
-- inode 8, inode 100 
 
 #### Dirty Inode 버퍼 (fs.c)
 ```c
 struct {
   struct spinlock lock;
-  struct dinode inodes[IPB];   // 최대 8개 inode 버퍼
-  uint inums[IPB];             // 해당 inode 번호
-  int count;                   // 버퍼된 inode 수
+  // Active buffer
+  struct dinode inodes[IPB];     // 최대 16개 inode 버퍼 (BSIZE=1024, IPB=16)
+  uint inums[IPB];               // 해당 inode 번호
+  uint versions[IPB];            // GC용 버전 정보
+  int count;                     // 버퍼된 inode 수
+  // Flushing buffer (sync 중 race condition 방지)
+  struct dinode flushing_inodes[IPB];
+  uint flushing_inums[IPB];
+  uint flushing_versions[IPB];
+  int flushing_count;
 } dirty_inodes;
 ```
 
@@ -331,7 +382,7 @@ struct {
 파일 B 쓰기:
   [데이터 B 기록] → inode B는 dirty 버퍼에 추가만 (sync 없음)
 
-Sync 시점 (버퍼가 가득 찼을 때 - 8개):
+Sync 시점 (버퍼가 가득 찼을 때 - 16개):
   [dirty inodes (A+B+...)를 한 블록에 기록]
   [imap 기록]
   [checkpoint 기록]
@@ -347,7 +398,7 @@ Sync 시점 (버퍼가 가득 찼을 때 - 8개):
 void iupdate(struct inode *ip) {
   // 1. inode를 dirty 버퍼에 추가
   //    └── 이미 버퍼에 있으면 갱신
-  //    └── 버퍼가 가득 차면 (8개) lfs_sync() 호출
+  //    └── 버퍼가 가득 차면 (IPB=16개) lfs_sync() 호출
 
   // 2. sync 없음 (Sprite LFS 방식)
   //    checkpoint는 버퍼가 가득 찼을 때만 기록
@@ -378,9 +429,9 @@ void lfs_sync(void) {
 ```
 
 ### 9.4 효과
-- **공간 효율**: 1개 inode당 64B (이전: 512B) - **8배 향상**
+- **공간 효율**: 1개 inode당 64B (이전: 1024B) - **16배 향상**
 - **I/O 효율**: 데이터 먼저, inode는 나중에 모아서 기록
-- mkfs 결과: log_tail이 ~585 블록
+- mkfs 결과: log_tail이 ~338 블록
 
 ---
 
@@ -394,7 +445,7 @@ Sprite LFS 방식에서는 dirty inode 버퍼가 가득 찼을 때만 sync가 �
 ### 10.2 Sync 트리거 조건
 | 조건 | 설명 | 파일 |
 |------|------|------|
-| **버퍼 Full** | dirty_inodes 버퍼가 8개 가득 찼을 때 | fs.c |
+| **버퍼 Full** | dirty_inodes 버퍼가 IPB(16)개 가득 찼을 때 | fs.c |
 | **주기적 Sync** | 약 1초마다 (100 ticks) | trap.c |
 | **Shutdown Sync** | panic() 호출 시 시스템 중단 전 | console.c |
 
@@ -517,16 +568,20 @@ LFS는 모든 쓰기를 로그의 끝(tail)에 순차적으로 기록하므로, 
 
 ### 12.2 GC를 위해 추가된 메타데이터
 
-#### 12.2.1 Imap 인코딩 변경 (fs.h)
+#### 12.2.1 Imap 인코딩 (fs.h)
 
-GC가 블록의 "활성(live)" 여부를 판단하려면 **버전(version)** 정보가 필요하다. 기존의 `(block << 3) | slot` 인코딩에서 버전 필드를 추가하여 3-필드 인코딩으로 변경했다.
+GC가 블록의 "활성(live)" 여부를 판단하려면 **버전(version)** 정보가 필요하다. imap 엔트리에 버전 필드를 포함한 3-필드 인코딩을 사용한다.
 
 ```c
-// 변경 전: imap[inum] = (block_addr << 3) | slot_index  (3비트 슬롯)
-// 변경 후: imap[inum] = (block_addr << 12) | (version << 4) | slot_index
+// imap[inum] = (block_addr << 12) | (version << 4) | slot_index
+// slot_index: 0-15 (4비트) - IPB=16을 위해
+// version: 0-255 (8비트) - GC staleness 감지용
+// block_addr: 나머지 20비트
 
-#define IMAP_SLOT_BITS    4    // 슬롯 인덱스: 0-15 (4비트)
-#define IMAP_VERSION_BITS 8    // 버전: 0-255 (8비트)
+#define IMAP_SLOT_BITS    4
+#define IMAP_VERSION_BITS 8
+#define IMAP_SLOT_MASK ((1 << IMAP_SLOT_BITS) - 1)     // 0xF
+#define IMAP_VERSION_MASK ((1 << IMAP_VERSION_BITS) - 1) // 0xFF
 #define IMAP_ENCODE(block, version, slot) \
   (((block) << 12) | (((version) & 0xFF) << 4) | ((slot) & 0xF))
 #define IMAP_BLOCK(entry)   ((entry) >> 12)
@@ -541,16 +596,22 @@ GC가 블록의 "활성(live)" 여부를 판단하려면 **버전(version)** 정
 세그먼트에 기록된 각 블록이 어떤 inode의 어떤 오프셋에 해당하는지를 기록하는 메타데이터 블록이다.
 
 ```c
-// SSB 엔트리: 각 데이터 블록에 대한 소유 정보
+// 블록 타입 상수 (non-zero, 0은 "엔트리 없음"을 의미)
+#define SSB_TYPE_DATA     1  // 데이터 블록
+#define SSB_TYPE_INODE    2  // inode 블록
+#define SSB_TYPE_INDIRECT 3  // indirect 블록
+
+// SSB 엔트리: 각 블록에 대한 소유 정보
 struct ssb_entry {
+  uchar type;     // 블록 타입 (SSB_TYPE_DATA, SSB_TYPE_INODE, SSB_TYPE_INDIRECT)
   uint inum;      // 이 블록을 소유한 inode 번호
-  uint offset;    // 파일 내 블록 오프셋 (SSB_INODE_BLOCK_MARKER이면 inode 블록)
+  uint offset;    // 파일 내 블록 오프셋 (INODE면 0xFFFFFFFF)
   uint version;   // 기록 시점의 inode 버전
 };
 
 // SSB 블록 헤더 (on-disk)
 #define SSB_MAGIC  0x53534221  // "SSB!" — SSB 블록 식별 매직 넘버
-#define SSB_ENTRIES_PER_BLOCK  ((BSIZE - 3*sizeof(uint)) / sizeof(struct ssb_entry))  // 84개
+#define SSB_ENTRIES_PER_BLOCK  ((BSIZE - 3*sizeof(uint)) / sizeof(struct ssb_entry))
 
 struct ssb {
   uint magic;      // SSB_MAGIC
@@ -560,12 +621,7 @@ struct ssb {
 };
 ```
 
-**SSB 기록 시점**: `lfs_sync()` 호출 시 `lfs_flush_ssb()`가 현재 SSB 버퍼를 디스크에 기록한다.
-
-**특수 오프셋 상수**:
-```c
-#define SSB_INODE_BLOCK_MARKER  0xFFFFFFFF  // offset 필드에 이 값이면 inode 블록
-```
+**SSB 기록 시점**: `lfs_sync()` 호출 시 현재 SSB 버퍼를 디스크에 기록한다. SSB는 세그먼트 경계 전환 시 또는 sync 시 flush된다.
 
 #### 12.2.3 Segment Usage Table — SUT (fs.h, fs.c)
 
@@ -578,10 +634,9 @@ struct sut_entry {
   uint age;         // 마지막 수정 시각 (ticks)
 };
 
-// 관련 상수
-#define NSUT_BLOCKS     64    // 최대 SUT 디스크 블록 수
-#define LFS_NSEGS_MAX   4000  // 최대 세그먼트 수
-#define SUT_FREE_MARKER 0xFFFFFFFF  // GC가 회수한 세그먼트 표시
+// 관련 상수 (fs.h)
+#define NSUT_BLOCKS     4      // 최대 SUT 디스크 블록 수
+#define LFS_NSEGS_MAX   1000   // 최대 세그먼트 수
 ```
 
 **런타임 상태** (`lfs` 구조체 내):
@@ -613,63 +668,32 @@ struct checkpoint {
 
 #### 12.2.5 LFS 런타임 상태 확장 (fs.c)
 
-`lfs` 구조체에 GC 관련 필드를 추가했다.
+`lfs` 구조체에 GC 관련 필드를 추가했다. (전체 구조체는 섹션 3.4 참조)
 
-```c
-struct {
-  struct spinlock lock;
-  uint imap[LFS_NINODES];
-  struct checkpoint cp;
-  uint log_tail;
-  uint cur_seg_end;                      // ← 현재 할당 가능 영역의 끝
-  int dev;
-  int syncing;
-
-  // GC / SUT 상태
-  struct sut_entry sut[LFS_NSEGS_MAX];   // ← 세그먼트 사용량 테이블
-  struct ssb_entry ssb_buf[LFS_SEGSIZE]; // ← 현재 세그먼트의 SSB 버퍼
-  uint ssb_count;                        // ← SSB 버퍼 내 엔트리 수
-
-  // 프리 세그먼트 순환 버퍼 (GC가 회수한 세그먼트)
-  uint free_segs[LFS_NSEGS_MAX];         // ← 프리 세그먼트 인덱스 배열
-  int free_head;                         // ← 순환 버퍼 head
-  int free_tail;                         // ← 순환 버퍼 tail
-  int free_count;                        // ← 프리 세그먼트 수
-
-  int gc_running;                        // ← GC 재진입 방지 플래그
-  int gc_failed;                         // ← GC 실패 플래그 (무한 트리거 방지)
-
-  // 펜딩 프리 세그먼트 (checkpoint sync 대기)
-  uint pending_free_segs[GC_TARGET_SEGS]; // ← 체크포인트 전 대기 목록
-  int pending_free_count;
-} lfs;
-```
+**GC 관련 주요 필드**:
+- `cur_seg_end`: 현재 할당 가능 영역의 끝 (세그먼트 경계)
+- `sut[]`: Segment Usage Table (live_bytes, age 추적)
+- `ssb_buf[]`, `ssb_flush_buf[]`: SSB 엔트리 버퍼 (double buffering)
+- `ssb_seg_start`: SSB가 기술하는 세그먼트의 시작 블록
+- `reserved_ssb_block`: 세그먼트 끝에 예약된 SSB 블록 주소
+- `free_segs[]`: GC가 회수한 프리 세그먼트 순환 버퍼
+- `gc_running`, `gc_failed`: GC 재진입/실패 방지 플래그
+- `pending_free_segs[]`: checkpoint sync 대기 중인 프리 세그먼트
 
 #### 12.2.6 Dirty Inode 버퍼 확장 (fs.c)
 
-GC가 inode를 재배치할 때 올바른 버전으로 imap에 기록하기 위해 `versions[]` 필드를 추가했다.
+GC가 inode를 재배치할 때 올바른 버전으로 imap에 기록하기 위해 `versions[]` 필드를 추가했다. (전체 구조체는 섹션 9.2 참조)
 
-```c
-struct {
-  struct spinlock lock;
-  struct dinode inodes[IPB];
-  uint inums[IPB];
-  uint versions[IPB];          // ← GC를 위해 추가: 각 inode의 버전
-  int count;
-  // Flushing buffer (sync 중 사용)
-  struct dinode flushing_inodes[IPB];
-  uint flushing_inums[IPB];
-  uint flushing_versions[IPB]; // ← GC를 위해 추가
-  int flushing_count;
-} dirty_inodes;
-```
+**GC 관련 추가 필드**:
+- `versions[]`: 각 버퍼된 inode의 버전 번호 (imap 업데이트 시 사용)
+- `flushing_*`: Double buffering으로 sync 중 race condition 방지
 
 #### 12.2.7 GC 관련 상수 (param.h)
 
 ```c
-#define GC_THRESHOLD       50   // GC 트리거 임계값 (디스크 사용률 %)
-#define GC_TARGET_SEGS      4   // GC 1회 실행 시 클리닝할 세그먼트 수
-#define GC_UTIL_THRESHOLD  80   // 클리닝 대상 최대 활용률 (%)
+#define GC_THRESHOLD       30   // GC 트리거 임계값 (디스크 사용률 %) - 일찍 트리거
+#define GC_TARGET_SEGS      8   // GC 1회 실행 시 클리닝할 세그먼트 수
+#define GC_UTIL_THRESHOLD  95   // 클리닝 대상 최대 활용률 (%)
 ```
 
 #### 12.2.8 Victim 선택 구조체 (fs.c)
@@ -706,11 +730,11 @@ score = (100 - u) × age / (100 + u) × 1000
 - `u`: 세그먼트 활용률 (%) — `live_bytes / (segsize × BSIZE) × 100`
 - `age`: 세그먼트 나이 — `ticks - sut[seg].age`
 - 활용률 100%인 세그먼트는 score = 0 (선택 불가)
-- 활용률 > `GC_UTIL_THRESHOLD`(80%)인 세그먼트는 스킵
-- `SUT_FREE_MARKER`로 표시된 세그먼트는 스킵 (이미 회수됨)
+- 활용률 > `GC_UTIL_THRESHOLD`(95%)인 세그먼트는 스킵
+- `live_bytes == 0xFFFFFFFF`인 세그먼트는 스킵 (이미 회수됨)
 - 현재 쓰기 중인 세그먼트는 스킵
 
-점수가 높은 순으로 최대 `GC_TARGET_SEGS`(4)개의 세그먼트를 선택한다.
+점수가 높은 순으로 최대 `GC_TARGET_SEGS`(8)개의 세그먼트를 선택한다.
 
 #### 12.3.3 세그먼트 클리닝 (`gc_clean_segment`)
 
@@ -729,16 +753,16 @@ score = (100 - u) × age / (100 + u) × 1000
            └── gc_relocate_block(): 블록 복사 + inode addrs[] 갱신
 
 3. 안전 스캔 (Safety Scan) — SSB 누락 시 fallback
-   ├── 조건: SSB가 아예 없는 세그먼트 (ssb_count == 0)에서만 실행
+   ├── **조건부 실행**: `if(ssb_count == 0)` — SSB가 전혀 없는 세그먼트에서만 실행
    ├── 3a. imap 전체 스캔: 이 세그먼트에 있는 inode 블록 찾기
    │   └── gc_relocate_inode_block()으로 재배치
    └── 3b. 모든 inode의 데이터 블록 스캔:
        ├── direct 블록 (addrs[0..11])
        ├── indirect 블록 자체 (addrs[NDIRECT])
-       └── indirect 블록 내 데이터 블록 (addrs[NDIRECT][0..255])
+       └── indirect 블록 내 데이터 블록 (addrs[NDIRECT][0..NINDIRECT-1])
 
    **참고**: Bug 7 수정 후 mkfs도 올바른 SSB를 생성하므로,
-   안전 스캔은 거의 실행되지 않음 (SSB 손상 시에만 필요)
+   정상적인 운영에서 안전 스캔은 실행되지 않음 (SSB 손상 시에만 필요)
 
 4. 세그먼트 해제 (gc_free_segment)
    └── pending_free_segs[]에 추가
@@ -1079,12 +1103,13 @@ hi
 
 | 파라미터 | 값 | 설명 |
 |----------|-----|------|
-| FSSIZE | 10000 | 디스크 크기 (블록) |
+| FSSIZE | 20000 | 디스크 크기 (블록) |
 | BSIZE | 1024 | 블록 크기 (바이트) |
-| LFS_SEGSIZE | 64 | 세그먼트 크기 (블록) |
-| nsegs | 156 | 세그먼트 수 |
+| LFS_SEGSIZE | 32 | 세그먼트 크기 (블록) |
+| nsegs | 624 | 세그먼트 수 ((FSSIZE - segstart) / LFS_SEGSIZE) |
 | segstart | 4 | 로그 시작 블록 |
 | LFS_NINODES | 200 | 최대 inode 수 |
+| IPB | 16 | 블록당 inode 수 (BSIZE / sizeof(dinode)) |
 
 ---
 
@@ -1104,10 +1129,11 @@ hi
 - 안전 스캔은 SSB가 없는 세그먼트에서만 실행 (일반적으로 불필요)
 - SUT 부분 갱신 최적화 적용됨
 
-### 15.4 알려진 경고 (정상 동작)
-- GC가 이전에 이미 relocate된 블록의 stale SSB 엔트리를 만나면 `INVALID block_addr` 경고 출력
-- 이는 version mismatch로 인해 skip되므로 데이터 무결성에 영향 없음
-- 경고는 정보 제공 목적이며, 향후 버전에서 제거 가능
+### 15.4 SSB Staleness 처리
+- GC가 이전에 이미 relocate된 블록의 stale SSB 엔트리를 만날 수 있음
+- 이는 imap의 version과 SSB entry의 version 비교로 감지됨
+- Version mismatch 시 해당 블록은 dead로 간주하고 skip
+- 데이터 무결성에 영향 없음
 
 ---
 
