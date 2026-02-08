@@ -805,6 +805,7 @@ lfs_sync()
 | `gc_cost_benefit()` | 세그먼트의 클리닝 점수 계산 |
 | `gc_clean_segment()` | 단일 세그먼트 클리닝 (SSB 파싱 + 블록 재배치 + 안전 스캔) |
 | `gc_find_ssbs()` | 세그먼트 내 SSB 블록 탐색 (매직 넘버 + 체크섬) |
+| `gc_alloc_block()` | GC 전용 블록 할당 (세그먼트 경계 SSB flush 처리) |
 | `gc_relocate_block()` | 데이터 블록 재배치 (direct/indirect + COW) |
 | `gc_relocate_inode_block()` | inode 블록 재배치 (imap 갱신) |
 | `gc_free_segment()` | 세그먼트를 pending 목록에 추가 |
@@ -1052,6 +1053,75 @@ if(bn < NDIRECT || entry->type == SSB_TYPE_INDIRECT){
 
 동일한 수정을 `read_from_disk` 경로에도 적용.
 
+### 13.10 Bug 10: GC 블록 할당 시 SSB가 다른 세그먼트에 기록되는 문제
+
+**증상**: `gctest`(FILESIZE=102400) 2회 실행 후 `ls` 명령에서 `exec ls failed` 발생. 디버그 출력에서 ELF magic이 `0x39b6`(garbage)으로 읽힘 — 정상값은 `0x464c457f`.
+
+**원인**: `gc_relocate_block()`과 `gc_relocate_inode_block()`의 블록 할당 코드에서, 현재 세그먼트가 꽉 찼을 때(`log_tail >= cur_seg_end`) **SSB 버퍼를 flush하지 않고** 새 세그먼트로 전환했다.
+
+문제의 흐름:
+```
+세그먼트 A [블록 100~131] (32블록):
+  GC가 블록 100, 101, ... 131까지 재배치하면서 SSB 엔트리 축적
+  → ssb_buf에 엔트리 31개 쌓임
+  → log_tail = 132 >= cur_seg_end = 132
+  → 새 세그먼트 B [블록 200~231]로 전환
+  → SSB 엔트리 31개는 아직 ssb_buf에 있음 (세그먼트 A에 기록 안 됨!)
+
+이후 lfs_write_ssb_now() 또는 gc_clean_segment 끝의 flush:
+  → SSB가 세그먼트 B에 기록됨
+  → 세그먼트 A 내 블록들의 SSB 엔트리가 세그먼트 B의 SSB에 들어감
+
+나중에 GC가 세그먼트 A를 다시 클리닝할 때:
+  → gc_find_ssbs()는 세그먼트 A 내부만 스캔 → SSB 못 찾음
+  → 다른 SSB가 있으면 (ssb_count > 0) safety scan도 안 함
+  → 재배치된 live 블록을 dead로 판단 → 세그먼트 해제
+  → 새 데이터가 해당 블록들을 덮어씀 → 데이터 손상
+```
+
+**32KB 파일에서 버그가 나타나지 않았던 이유**: 32KB×40파일 = 약 1,280블록(~6.4%). gctest 2회 실행해도 ~12.8%로 GC_THRESHOLD(30%)에 미달하여 GC 자체가 트리거되지 않았다. 100KB 파일은 1회 실행으로 ~30%에 도달하여 GC가 트리거되고, 세그먼트 전환이 발생하면서 버그가 현실화되었다.
+
+**수정**: `gc_alloc_block()` 헬퍼 함수를 추가하여, 블록 할당 전에 세그먼트 경계를 확인하고 SSB를 올바른 위치에 flush한다:
+
+```c
+static uint
+gc_alloc_block(uchar type, uint inum, uint offset, uint version)
+{
+  static struct ssb_entry gc_ssb_tmp[SSB_ENTRIES_PER_BLOCK];
+  // ...
+  acquire(&lfs.lock);
+
+  // 핵심: 세그먼트에 1블록만 남았고 SSB 엔트리가 있으면 → 그 블록에 SSB flush
+  if(lfs.log_tail < lfs.cur_seg_end){
+    uint remaining = lfs.cur_seg_end - lfs.log_tail;
+    if(remaining == 1 && lfs.ssb_count > 0){
+      uint ssb_block = lfs.log_tail++;
+      // SSB를 이 블록에 기록 (세그먼트 내에 SSB가 남음)
+      // ...
+    }
+  }
+
+  // 세그먼트 전환 (SSB는 이미 올바른 세그먼트에 기록됨)
+  if(lfs.log_tail >= lfs.cur_seg_end){
+    // 새 프리 세그먼트로 전환
+  }
+
+  block = lfs.log_tail++;
+  // SSB 엔트리 추가 (새 세그먼트에 속함)
+  // ...
+  return block;
+}
+```
+
+기존의 수동 할당 코드 4곳을 `gc_alloc_block()` 호출로 교체:
+
+| 위치 | 함수 | 용도 |
+|------|------|------|
+| `gc_relocate_inode_block()` | inode 블록 할당 | 메인 할당 |
+| `gc_relocate_block()` | 데이터 블록 할당 | 메인 할당 |
+| `gc_relocate_block()` | COW indirect 블록 | dirty 버퍼 경로 |
+| `gc_relocate_block()` | COW indirect 블록 | 디스크 읽기 경로 |
+
 ---
 
 ## 14. 최종 테스트 결과
@@ -1139,7 +1209,7 @@ hi
 
 ## 16. 버그 수정 요약
 
-총 9개의 버그를 발견하고 수정함:
+총 10개의 버그를 발견하고 수정함:
 
 | # | 버그 | 증상 | 원인 | 수정 |
 |---|------|------|------|------|
@@ -1152,11 +1222,13 @@ hi
 | 7 | **SSB_TYPE_DATA=0** | `exec echo failed` | DATA 블록 SSB 미생성 | 상수값 1로 변경 |
 | 8 | **새 inode imap 미설정** | `inode not in imap` | imap[]=0 조건 오류 | type 체크로 변경 |
 | 9 | **INDIRECT 이중 복사** | INVALID block_addr 경고 | 잘못된 분기 진입 | 분기 조건 수정 |
+| 10 | **GC SSB 세그먼트 경계** | `exec ls failed` (ELF 손상) | 세그먼트 전환 시 SSB 미flush | `gc_alloc_block()` 헬퍼 추가 |
 
 **핵심 교훈**:
 - 상수 정의 시 0을 특별한 의미("없음")로 사용할 때 주의 필요
 - 새로 생성되는 객체와 삭제된 객체의 초기값이 같을 때 구분 방법 고려 필요
 - 블록 타입(DATA, INODE, INDIRECT)에 따른 처리 경로 명확히 분리 필요
+- 세그먼트 전환 시 해당 세그먼트에 속하는 메타데이터(SSB)가 반드시 같은 세그먼트에 기록되어야 함
 
 ---
 
