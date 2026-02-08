@@ -680,6 +680,78 @@ gc_free_segment(uint seg_idx)
   release(&lfs.lock);
 }
 
+// Allocate a block during GC with proper SSB handling at segment boundaries.
+// Flushes SSB buffer to disk when the current segment is about to fill up,
+// ensuring SSB entries stay within the segment they describe.
+// Returns allocated block number, or 0 on failure (out of space).
+// Caller must NOT hold lfs.lock.
+static uint
+gc_alloc_block(uchar type, uint inum, uint offset, uint version)
+{
+  static struct ssb_entry gc_ssb_tmp[SSB_ENTRIES_PER_BLOCK];
+  uint block;
+
+  acquire(&lfs.lock);
+
+  // Check if current segment has only 1 block remaining and SSB needs flushing.
+  // We must write SSB to the last block of the segment before switching.
+  if(lfs.log_tail < lfs.cur_seg_end){
+    uint remaining = lfs.cur_seg_end - lfs.log_tail;
+    if(remaining == 1 && lfs.ssb_count > 0){
+      // Use the last block for SSB flush
+      uint ssb_block = lfs.log_tail++;
+      int count = lfs.ssb_count;
+      memmove(gc_ssb_tmp, lfs.ssb_buf, count * sizeof(struct ssb_entry));
+      lfs.ssb_count = 0;
+      release(&lfs.lock);
+
+      // Write SSB to disk (outside lock)
+      struct buf *bp = bread(lfs.dev, ssb_block);
+      memset(bp->data, 0, BSIZE);
+      struct ssb *ssb_ptr = (struct ssb *)bp->data;
+      ssb_ptr->magic = SSB_MAGIC;
+      ssb_ptr->nblocks = count;
+      ssb_ptr->checksum = gc_compute_checksum(gc_ssb_tmp, count);
+      memmove(ssb_ptr->entries, gc_ssb_tmp, count * sizeof(struct ssb_entry));
+      bwrite(bp);
+      brelse(bp);
+
+      acquire(&lfs.lock);
+      // Now log_tail == cur_seg_end, falls through to segment switch below
+    }
+  }
+
+  // Switch to new free segment if needed
+  if(lfs.log_tail >= lfs.cur_seg_end){
+    if(lfs.free_count > 0){
+      uint free_seg = lfs.free_segs[lfs.free_head];
+      lfs.free_head = (lfs.free_head + 1) % LFS_NSEGS_MAX;
+      lfs.free_count--;
+      lfs.log_tail = sb.segstart + free_seg * sb.segsize;
+      lfs.cur_seg_end = lfs.log_tail + sb.segsize;
+      lfs.sut[free_seg].live_bytes = 0;
+    } else {
+      release(&lfs.lock);
+      return 0;  // Out of space
+    }
+  }
+
+  // Allocate block
+  block = lfs.log_tail++;
+
+  // Add SSB entry
+  if(lfs.ssb_count < SSB_ENTRIES_PER_BLOCK){
+    lfs.ssb_buf[lfs.ssb_count].type = type;
+    lfs.ssb_buf[lfs.ssb_count].inum = inum;
+    lfs.ssb_buf[lfs.ssb_count].offset = offset;
+    lfs.ssb_buf[lfs.ssb_count].version = version;
+    lfs.ssb_count++;
+  }
+
+  release(&lfs.lock);
+  return block;
+}
+
 // Relocate an inode block to the current log tail
 // Updates imap entries for all inodes in the block
 // Returns 0 on success, -1 on failure (out of space)
@@ -700,26 +772,9 @@ gc_relocate_inode_block(uint inum, uint old_block)
   // 1. Read old inode block
   bp_old = bread(lfs.dev, old_block);
 
-  // 2. Allocate new block at log tail
+  // 2. Find first inum in this block for SSB entry
+  uint first_inum = inum;
   acquire(&lfs.lock);
-  if(lfs.log_tail >= lfs.cur_seg_end){
-    if(lfs.free_count > 0){
-      uint free_seg = lfs.free_segs[lfs.free_head];
-      lfs.free_head = (lfs.free_head + 1) % LFS_NSEGS_MAX;
-      lfs.free_count--;
-      lfs.log_tail = sb.segstart + free_seg * sb.segsize;
-      lfs.cur_seg_end = lfs.log_tail + sb.segsize;
-      lfs.sut[free_seg].live_bytes = 0;
-    } else {
-      release(&lfs.lock);
-      brelse(bp_old);
-      return -1;  // Out of space
-    }
-  }
-  new_block = lfs.log_tail++;
-
-  // Find first inum in this block for SSB entry
-  uint first_inum = 0;
   for(i = 0; i < LFS_NINODES; i++){
     uint entry = lfs.imap[i];
     if(entry != 0 && entry != 0xFFFFFFFF){
@@ -729,16 +784,14 @@ gc_relocate_inode_block(uint inum, uint old_block)
       }
     }
   }
-
-  // Add single SSB entry for the inode block (GC will check all imaps)
-  if(lfs.ssb_count < SSB_ENTRIES_PER_BLOCK){
-    lfs.ssb_buf[lfs.ssb_count].type = SSB_TYPE_INODE;
-    lfs.ssb_buf[lfs.ssb_count].inum = first_inum;
-    lfs.ssb_buf[lfs.ssb_count].offset = 0;
-    lfs.ssb_buf[lfs.ssb_count].version = 0;  // Not used for block-level check
-    lfs.ssb_count++;
-  }
   release(&lfs.lock);
+
+  // 3. Allocate new block with SSB entry (handles segment boundary SSB flush)
+  new_block = gc_alloc_block(SSB_TYPE_INODE, first_inum, 0, 0);
+  if(new_block == 0){
+    brelse(bp_old);
+    return -1;  // Out of space
+  }
 
   // 3. Write inode block to new location
   // IMPORTANT: Apply any dirty buffer updates to the copied data
@@ -834,35 +887,12 @@ gc_relocate_block(struct ssb_entry *entry, uint old_block)
   // 2. Read old block data
   bp_old = bread(lfs.dev, old_block);
 
-  // 3. Allocate new block at log tail with atomic SSB entry
-  acquire(&lfs.lock);
-  // Check if we need to switch to a free segment
-  if(lfs.log_tail >= lfs.cur_seg_end){
-    if(lfs.free_count > 0){
-      uint free_seg = lfs.free_segs[lfs.free_head];
-      lfs.free_head = (lfs.free_head + 1) % LFS_NSEGS_MAX;
-      lfs.free_count--;
-      lfs.log_tail = sb.segstart + free_seg * sb.segsize;
-      lfs.cur_seg_end = lfs.log_tail + sb.segsize;
-      lfs.sut[free_seg].live_bytes = 0;
-    } else {
-      release(&lfs.lock);
-      brelse(bp_old);
-      // Return error instead of panicking - GC will stop early
-      return -1;
-    }
+  // 3. Allocate new block with SSB entry (handles segment boundary SSB flush)
+  new_block = gc_alloc_block(entry->type, entry->inum, entry->offset, current_version);
+  if(new_block == 0){
+    brelse(bp_old);
+    return -1;  // Out of space
   }
-  new_block = lfs.log_tail++;
-
-  // Atomically add SSB entry for relocated block (while still holding lock)
-  if(lfs.ssb_count < SSB_ENTRIES_PER_BLOCK){
-    lfs.ssb_buf[lfs.ssb_count].type = entry->type;
-    lfs.ssb_buf[lfs.ssb_count].inum = entry->inum;
-    lfs.ssb_buf[lfs.ssb_count].offset = entry->offset;
-    lfs.ssb_buf[lfs.ssb_count].version = current_version;
-    lfs.ssb_count++;
-  }
-  release(&lfs.lock);
 
   // 4. Write data to new block
   bp_new = bread(lfs.dev, new_block);
@@ -966,32 +996,10 @@ gc_relocate_block(struct ssb_entry *entry, uint old_block)
         struct buf *bp_ind, *bp_new_ind;
         uint new_ind;
 
-        acquire(&lfs.lock);
-        if(lfs.log_tail >= lfs.cur_seg_end){
-          if(lfs.free_count > 0){
-            uint free_seg = lfs.free_segs[lfs.free_head];
-            lfs.free_head = (lfs.free_head + 1) % LFS_NSEGS_MAX;
-            lfs.free_count--;
-            lfs.log_tail = sb.segstart + free_seg * sb.segsize;
-            lfs.cur_seg_end = lfs.log_tail + sb.segsize;
-            lfs.sut[free_seg].live_bytes = 0;
-          } else {
-            // Out of space for indirect block - cannot continue
-            release(&lfs.lock);
-            return -1;
-          }
+        new_ind = gc_alloc_block(SSB_TYPE_INDIRECT, entry->inum, NDIRECT, current_version);
+        if(new_ind == 0){
+          return -1;  // Out of space
         }
-        new_ind = lfs.log_tail++;
-
-        // Atomically add SSB entry for new indirect block
-        if(lfs.ssb_count < SSB_ENTRIES_PER_BLOCK){
-          lfs.ssb_buf[lfs.ssb_count].type = SSB_TYPE_INDIRECT;
-          lfs.ssb_buf[lfs.ssb_count].inum = entry->inum;
-          lfs.ssb_buf[lfs.ssb_count].offset = NDIRECT;
-          lfs.ssb_buf[lfs.ssb_count].version = current_version;
-          lfs.ssb_count++;
-        }
-        release(&lfs.lock);
 
         // Validate old_ind before reading
         if(old_ind >= sb.size){
@@ -1101,32 +1109,10 @@ read_from_disk:
       struct buf *bp_ind, *bp_new_ind;
       uint new_ind;
 
-      acquire(&lfs.lock);
-      if(lfs.log_tail >= lfs.cur_seg_end){
-        if(lfs.free_count > 0){
-          uint free_seg = lfs.free_segs[lfs.free_head];
-          lfs.free_head = (lfs.free_head + 1) % LFS_NSEGS_MAX;
-          lfs.free_count--;
-          lfs.log_tail = sb.segstart + free_seg * sb.segsize;
-          lfs.cur_seg_end = lfs.log_tail + sb.segsize;
-          lfs.sut[free_seg].live_bytes = 0;
-        } else {
-          // Out of space for indirect block - cannot continue
-          release(&lfs.lock);
-          return -1;
-        }
+      new_ind = gc_alloc_block(SSB_TYPE_INDIRECT, entry->inum, NDIRECT, current_version);
+      if(new_ind == 0){
+        return -1;  // Out of space
       }
-      new_ind = lfs.log_tail++;
-
-      // Atomically add SSB entry for new indirect block
-      if(lfs.ssb_count < SSB_ENTRIES_PER_BLOCK){
-        lfs.ssb_buf[lfs.ssb_count].type = SSB_TYPE_INDIRECT;
-        lfs.ssb_buf[lfs.ssb_count].inum = entry->inum;
-        lfs.ssb_buf[lfs.ssb_count].offset = NDIRECT;
-        lfs.ssb_buf[lfs.ssb_count].version = current_version;
-        lfs.ssb_count++;
-      }
-      release(&lfs.lock);
 
       // Validate old_ind before reading
       if(old_ind >= sb.size){

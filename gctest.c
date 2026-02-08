@@ -8,7 +8,7 @@
 #include "user.h"
 #include "fcntl.h"
 
-#define FILESIZE 32768   // 32KB per file (32 blocks)
+#define FILESIZE 102400  // 100KB per file (100 blocks)
 #define NFILES   40      // Number of test files
 
 char buf[512];
