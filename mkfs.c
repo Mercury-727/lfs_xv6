@@ -252,9 +252,13 @@ ssb_checksum(struct ssb_entry *entries, int count)
   return checksum;
 }
 
+// Current checkpoint timestamp (for SSB)
+uint current_timestamp = 1;
+
 // Flush SSB buffer to disk
+// next_seg_addr: next segment address for roll-forward (0 if not at boundary)
 void
-lfs_flush_ssb(void)
+lfs_flush_ssb_with_next(uint next_seg_addr)
 {
   if(ssb_count == 0)
     return;
@@ -272,6 +276,8 @@ lfs_flush_ssb(void)
   ssb_ptr = (struct ssb *)buf;
   ssb_ptr->magic = xint(SSB_MAGIC);
   ssb_ptr->nblocks = xint(ssb_count);
+  ssb_ptr->timestamp = xint(current_timestamp);
+  ssb_ptr->next_seg_addr = xint(next_seg_addr);
 
   // Copy entries first (convert to little-endian / disk format)
   for(int i = 0; i < ssb_count; i++){
@@ -286,6 +292,12 @@ lfs_flush_ssb(void)
 
   wsect(block, buf);
   ssb_count = 0;
+}
+
+void
+lfs_flush_ssb(void)
+{
+  lfs_flush_ssb_with_next(0);
 }
 
 // Allocate a block with SSB entry
@@ -401,11 +413,12 @@ lfs_write_imap(void)
   }
 }
 
-// Write checkpoint to fixed location
+// Write checkpoint to fixed location with header/footer timestamps
 void
 lfs_write_checkpoint(void)
 {
   char buf[BSIZE];
+  uint ts = current_timestamp;
 
   // Flush any pending SSB entries first
   lfs_flush_ssb();
@@ -419,20 +432,36 @@ lfs_write_checkpoint(void)
   // Write imap (after flush, so addresses are correct)
   lfs_write_imap();
 
-  cp.timestamp = xint(1);  // simple timestamp
+  // Set checkpoint fields
+  cp.timestamp = xint(ts);           // Header timestamp
   cp.log_tail = xint(log_tail);
   cp.cur_seg = xint((log_tail - LFS_SEGSTART) / LFS_SEGSIZE);
   cp.seg_offset = xint((log_tail - LFS_SEGSTART) % LFS_SEGSIZE);
   cp.valid = xint(1);
+  cp.timestamp_end = xint(ts);       // Footer timestamp (must match header)
 
+  // Prepare block: header timestamp at offset 0, footer at offset BSIZE-4
   memset(buf, 0, BSIZE);
-  memmove(buf, &cp, sizeof(cp));
+
+  // Copy header timestamp (first 4 bytes)
+  memmove(buf, &cp.timestamp, sizeof(uint));
+
+  // Copy metadata (after timestamp, before footer)
+  memmove(buf + sizeof(uint),
+          ((char*)&cp) + sizeof(uint),
+          sizeof(cp) - 2 * sizeof(uint));
+
+  // Copy footer timestamp (last 4 bytes of block)
+  memmove(buf + BSIZE - sizeof(uint), &cp.timestamp_end, sizeof(uint));
 
   // Write to checkpoint0
   wsect(2, buf);
 
-  printf("Checkpoint written: log_tail=%d, imap_nblocks=%d\n",
-         log_tail, xint(cp.imap_nblocks));
+  // Also write to checkpoint1 for initial filesystem
+  wsect(3, buf);
+
+  printf("Checkpoint written: log_tail=%d, imap_nblocks=%d, timestamp=%d\n",
+         log_tail, xint(cp.imap_nblocks), ts);
 }
 
 // Allocate a new inode

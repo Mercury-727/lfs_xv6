@@ -28,49 +28,16 @@ exec(char *path, char **argv)
   if((ip = namei(path)) == 0){
     end_op();
     cprintf("exec: fail (path=%s)\n", path);
-    // Debug: dump root directory info
-    begin_op();
-    struct inode *root = namei("/");
-    if(root){
-      ilock(root);
-      cprintf("  root: inum=%d size=%d addrs[0]=%d\n",
-              root->inum, root->size, root->addrs[0]);
-      // Read first few directory entries
-      struct dirent de;
-      int found_echo = 0;
-      for(uint off = 0; off < root->size; off += sizeof(de)){
-        if(readi(root, (char*)&de, off, sizeof(de)) == sizeof(de)){
-          if(de.inum != 0){
-            cprintf("  [%d] inum=%d name=%s\n", off, de.inum, de.name);
-            if(de.name[0]=='e' && de.name[1]=='c' && de.name[2]=='h' && de.name[3]=='o')
-              found_echo = 1;
-          }
-        }
-      }
-      if(!found_echo) cprintf("  echo NOT FOUND in directory!\n");
-      iunlockput(root);
-    } else {
-      cprintf("  root directory not found!\n");
-    }
-    end_op();
     return -1;
   }
   ilock(ip);
   pgdir = 0;
 
-  // Debug: show inode info
-  cprintf("exec: found %s, inum=%d size=%d addrs[0]=%d\n",
-          path, ip->inum, ip->size, ip->addrs[0]);
-
   // Check ELF header
-  if(readi(ip, (char*)&elf, 0, sizeof(elf)) != sizeof(elf)){
-    cprintf("exec: readi ELF header failed\n");
+  if(readi(ip, (char*)&elf, 0, sizeof(elf)) != sizeof(elf))
     goto bad;
-  }
-  if(elf.magic != ELF_MAGIC){
-    cprintf("exec: bad ELF magic 0x%x (expected 0x%x)\n", elf.magic, ELF_MAGIC);
+  if(elf.magic != ELF_MAGIC)
     goto bad;
-  }
 
   if((pgdir = setupkvm()) == 0)
     goto bad;

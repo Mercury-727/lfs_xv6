@@ -26,7 +26,7 @@ struct superblock {
 #define NIMAP_BLOCKS 4
  
 // Maximum SUT blocks
-#define NSUT_BLOCKS 4
+#define NSUT_BLOCKS 8
 #define LFS_NSEGS_MAX 1000
 
 // Block types for SSB (must be non-zero, 0 means no SSB entry)
@@ -45,14 +45,16 @@ struct ssb_entry {
 // SSB Magic number for identification
 #define SSB_MAGIC 0x53534221  // "SSB!"
 
-// SSB entries per block: (BSIZE - 12) / 16 (approx aligned size) = 63 entries
-#define SSB_ENTRIES_PER_BLOCK ((BSIZE - 3*sizeof(uint)) / sizeof(struct ssb_entry))
+// SSB entries per block: (BSIZE - 20) / 16 = 62 entries (adjusted for new header fields)
+#define SSB_ENTRIES_PER_BLOCK ((BSIZE - 5*sizeof(uint)) / sizeof(struct ssb_entry))
 
 // Segment Summary Block (on-disk format with header)
 struct ssb {
-  uint magic;       // SSB_MAGIC - SSB block identification
-  uint nblocks;     // Number of data blocks this SSB describes
-  uint checksum;    // Checksum of entries for integrity verification
+  uint magic;         // SSB_MAGIC - SSB block identification
+  uint nblocks;       // Number of data blocks this SSB describes
+  uint checksum;      // Checksum of entries for integrity verification
+  uint timestamp;     // Timestamp for roll-forward ordering
+  uint next_seg_addr; // Next segment address (0 if not at segment boundary)
   struct ssb_entry entries[SSB_ENTRIES_PER_BLOCK];
 };
 
@@ -62,9 +64,17 @@ struct sut_entry {
   uint age;      // Last modification time (ticks or sequence)
 };
 
-// Checkpoint structure - stored at fixed location
+// Checkpoint structure - stored at fixed location (exactly BSIZE bytes)
+// Layout: [header_ts | metadata | padding | footer_ts]
+// Header and footer timestamps must match for valid checkpoint
+#define CP_METADATA_SIZE (6 * sizeof(uint) + NIMAP_BLOCKS * sizeof(uint) + NSUT_BLOCKS * sizeof(uint))
+#define CP_PADDING_SIZE (BSIZE - CP_METADATA_SIZE - 2 * sizeof(uint))
+
 struct checkpoint {
-  uint timestamp;                    // Checkpoint timestamp
+  // === Header (offset 0, first sector) ===
+  uint timestamp;                    // Header timestamp - written FIRST
+
+  // === Metadata ===
   uint log_tail;                     // Current log tail (next write position)
   uint cur_seg;                      // Current segment number
   uint seg_offset;                   // Offset within current segment
@@ -73,6 +83,12 @@ struct checkpoint {
   uint sut_addrs[NSUT_BLOCKS];       // Disk addresses of SUT blocks
   uint sut_nblocks;                  // Number of SUT blocks in use
   uint valid;                        // Is this checkpoint valid?
+
+  // === Padding to push footer to end of block (last sector) ===
+  uchar padding[CP_PADDING_SIZE];
+
+  // === Footer (offset BSIZE-4, last 4 bytes) ===
+  uint timestamp_end;                // Footer timestamp - written LAST
 };
 
 // Imap entries per block

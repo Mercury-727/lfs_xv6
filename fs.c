@@ -33,6 +33,7 @@
 
 static void itrunc(struct inode*);
 static void lfs_flush_inodes(void);
+static void lfs_flush_only(void);  // Flush dirty inodes/SSB only, no checkpoint
 static void lfs_write_imap(void);
 static void lfs_write_sut(void);
 void lfs_flush_ssb_inline(void);  // Legacy compatibility
@@ -65,6 +66,7 @@ struct {
   uint ssb_pending_block;      // Block allocated for pending SSB (to write after alloc returns)
   uint reserved_ssb_block;     // Explicitly reserved block for SSB (at end of segment)
   int ssb_pending_count;       // Number of entries in pending SSB
+  uint ssb_next_seg;           // Next segment address for roll-forward (set at segment boundary)
   // GC free segment list (circular buffer)
   uint free_segs[LFS_NSEGS_MAX];  // Free segment indices
   int free_head;                   // Free list head index
@@ -134,25 +136,89 @@ lfs_read_sut(int dev)
   }
 }
 
-// Read checkpoint from disk
+// Validate checkpoint: header timestamp must match footer timestamp
+static int
+lfs_checkpoint_valid(struct checkpoint *cp)
+{
+  return (cp->valid && cp->timestamp == cp->timestamp_end && cp->timestamp > 0);
+}
+
+// Select best checkpoint from cp0 and cp1
+// Returns: 0 = cp0 selected, 1 = cp1 selected, -1 = no valid checkpoint (first boot)
+static int
+lfs_select_checkpoint(int dev, struct checkpoint *cp_out)
+{
+  struct buf *bp0, *bp1;
+  struct checkpoint cp0, cp1;
+  int cp0_valid, cp1_valid;
+  uint *footer;
+
+  // Read checkpoint0
+  // Header timestamp is at offset 0, footer timestamp is at BSIZE-4
+  bp0 = bread(dev, sb.checkpoint0);
+  memmove(&cp0, bp0->data, sizeof(cp0));
+  // Read footer timestamp from last 4 bytes of block
+  footer = (uint*)(bp0->data + BSIZE - sizeof(uint));
+  cp0.timestamp_end = *footer;
+  brelse(bp0);
+
+  // Read checkpoint1
+  bp1 = bread(dev, sb.checkpoint1);
+  memmove(&cp1, bp1->data, sizeof(cp1));
+  // Read footer timestamp from last 4 bytes of block
+  footer = (uint*)(bp1->data + BSIZE - sizeof(uint));
+  cp1.timestamp_end = *footer;
+  brelse(bp1);
+
+  // Validate: header timestamp == footer timestamp
+  cp0_valid = lfs_checkpoint_valid(&cp0);
+  cp1_valid = lfs_checkpoint_valid(&cp1);
+
+  cprintf("lfs_select_checkpoint: cp0(ts=%d, ts_end=%d, valid=%d) cp1(ts=%d, ts_end=%d, valid=%d)\n",
+          cp0.timestamp, cp0.timestamp_end, cp0_valid,
+          cp1.timestamp, cp1.timestamp_end, cp1_valid);
+
+  if(!cp0_valid && !cp1_valid){
+    return -1;  // First boot - no valid checkpoint
+  }
+
+  if(cp0_valid && !cp1_valid){
+    memmove(cp_out, &cp0, sizeof(cp0));
+    return 0;
+  }
+
+  if(!cp0_valid && cp1_valid){
+    memmove(cp_out, &cp1, sizeof(cp1));
+    return 1;
+  }
+
+  // Both valid - select higher timestamp
+  if(cp1.timestamp > cp0.timestamp){
+    memmove(cp_out, &cp1, sizeof(cp1));
+    return 1;
+  }
+  memmove(cp_out, &cp0, sizeof(cp0));
+  return 0;
+}
+
+// Read checkpoint from disk (dual checkpoint with validation)
 static void
 lfs_read_checkpoint(int dev)
 {
-  struct buf *bp;
+  int selected = lfs_select_checkpoint(dev, &lfs.cp);
 
-  // Read checkpoint0
-  bp = bread(dev, sb.checkpoint0);
-  memmove(&lfs.cp, bp->data, sizeof(lfs.cp));
-  brelse(bp);
-
-  if(lfs.cp.valid == 0){
-    // First boot? Initialize log_tail
+  if(selected < 0){
+    // First boot - no valid checkpoint
     lfs.log_tail = sb.segstart;
-    cprintf("lfs_read_checkpoint: invalid checkpoint (first boot?)\n");
+    lfs.cp.timestamp = 0;
+    lfs.cp.timestamp_end = 0;
+    cprintf("lfs_read_checkpoint: no valid checkpoint (first boot)\n");
     return;
   }
 
   lfs.log_tail = lfs.cp.log_tail;
+  cprintf("lfs_read_checkpoint: using checkpoint%d (timestamp=%d, log_tail=%d)\n",
+          selected, lfs.cp.timestamp, lfs.log_tail);
 }
 
 // Read imap from disk (locations stored in checkpoint)
@@ -175,28 +241,63 @@ lfs_read_imap(int dev)
   }
 }
 
-// Write checkpoint to disk (just checkpoint, no flush/imap)
+// Write checkpoint to disk with atomic header/footer timestamps
+// Write order: header timestamp -> metadata -> footer timestamp
+// Alternates between checkpoint0 and checkpoint1
 static void
 lfs_write_checkpoint(void)
 {
   struct buf *bp;
-  struct checkpoint cp_copy;
+  uint ts;
+  uint target_block;
+  uchar *block_data;
 
-  // Copy checkpoint data under lock
+  // Prepare checkpoint data under lock
   acquire(&lfs.lock);
-  lfs.cp.timestamp++;
+  ts = ++lfs.cp.timestamp;
   lfs.cp.log_tail = lfs.log_tail;
   lfs.cp.cur_seg = (lfs.log_tail - sb.segstart) / sb.segsize;
   lfs.cp.seg_offset = (lfs.log_tail - sb.segstart) % sb.segsize;
   lfs.cp.valid = 1;
-  memmove(&cp_copy, &lfs.cp, sizeof(cp_copy));
+  // Header timestamp set, footer will be set at the end
+  lfs.cp.timestamp_end = 0;  // Clear footer initially
+
+  // Select target checkpoint block (alternate based on timestamp)
+  target_block = (ts % 2 == 1) ? sb.checkpoint0 : sb.checkpoint1;
   release(&lfs.lock);
 
-  // Write checkpoint (outside lock)
-  bp = bread(lfs.dev, sb.checkpoint0);
-  memmove(bp->data, &cp_copy, sizeof(cp_copy));
+  // Read the block
+  bp = bread(lfs.dev, target_block);
+  block_data = bp->data;
+
+  // STEP 1: Write header timestamp FIRST (offset 0)
+  // This marks the start of checkpoint write
+  memmove(block_data, &ts, sizeof(uint));
   bwrite(bp);
+
+  // STEP 2: Write metadata (offset 4 to end-4)
+  // Copy all metadata fields after timestamp
+  acquire(&lfs.lock);
+  memmove(block_data + sizeof(uint),
+          ((uchar*)&lfs.cp) + sizeof(uint),
+          sizeof(struct checkpoint) - 2 * sizeof(uint));  // Exclude both timestamps
+  release(&lfs.lock);
+  bwrite(bp);
+
+  // STEP 3: Write footer timestamp LAST (last 4 bytes of block)
+  // This marks successful completion of checkpoint write
+  memmove(block_data + BSIZE - sizeof(uint), &ts, sizeof(uint));
+  bwrite(bp);
+
   brelse(bp);
+
+  // Update in-memory footer timestamp
+  acquire(&lfs.lock);
+  lfs.cp.timestamp_end = ts;
+  release(&lfs.lock);
+
+  cprintf("lfs_write_checkpoint: wrote to checkpoint%d (ts=%d)\n",
+          (ts % 2 == 1) ? 0 : 1, ts);
 }
 
 // Write SUT to log (Dynamic size & Partial update)
@@ -301,13 +402,15 @@ lfs_add_ssb_entry(uchar type, uint inum, uint offset, uint version)
 // Write current SSB entries to log NOW (unconditionally)
 // Returns the block number where SSB was written, or 0 if nothing to write or out of space
 // MUST be called WITHOUT holding lfs.lock
+// next_seg: next segment address to store in SSB (0 if not at segment boundary)
 static uint
-lfs_write_ssb_now(void)
+lfs_write_ssb_now_with_next(uint next_seg)
 {
   struct buf *bp;
   struct ssb *ssb_ptr;
   uint block = 0;
   int count;
+  uint timestamp;
 
   acquire(&lfs.lock);
 
@@ -327,6 +430,7 @@ lfs_write_ssb_now(void)
   lfs.ssb_flushing = 1;
   memmove(lfs.ssb_flush_buf, lfs.ssb_buf, count * sizeof(struct ssb_entry));
   lfs.ssb_count = 0;
+  timestamp = lfs.cp.timestamp;  // Use current checkpoint timestamp
 
   // Use explicitly reserved block if available (from lfs_alloc segment switch)
   if(lfs.reserved_ssb_block != 0){
@@ -364,6 +468,8 @@ lfs_write_ssb_now(void)
   ssb_ptr->magic = SSB_MAGIC;
   ssb_ptr->nblocks = count;
   ssb_ptr->checksum = gc_compute_checksum(lfs.ssb_flush_buf, count);
+  ssb_ptr->timestamp = timestamp;
+  ssb_ptr->next_seg_addr = next_seg;  // 0 if not at segment boundary
   memmove(ssb_ptr->entries, lfs.ssb_flush_buf, count * sizeof(struct ssb_entry));
   bwrite(bp);
   brelse(bp);
@@ -376,6 +482,13 @@ lfs_write_ssb_now(void)
   return block;
 }
 
+// Write current SSB entries to log NOW (no segment boundary)
+static uint
+lfs_write_ssb_now(void)
+{
+  return lfs_write_ssb_now_with_next(0);
+}
+
 // Legacy function for compatibility
 void
 lfs_flush_ssb_inline(void)
@@ -386,11 +499,13 @@ lfs_flush_ssb_inline(void)
 // Write pending SSB that was prepared during segment switch
 // MUST be called WITHOUT holding lfs.lock
 // Called from writei() after lfs_alloc() returns
+// next_seg: next segment address for roll-forward
 static void
-lfs_write_pending_ssb(void)
+lfs_write_pending_ssb_with_next(uint next_seg)
 {
   uint block;
   int count;
+  uint timestamp;
 
   acquire(&lfs.lock);
   if(!lfs.ssb_flushing || lfs.ssb_pending_count == 0){
@@ -399,6 +514,7 @@ lfs_write_pending_ssb(void)
   }
   block = lfs.ssb_pending_block;
   count = lfs.ssb_pending_count;
+  timestamp = lfs.cp.timestamp;
   release(&lfs.lock);
 
   // Write SSB block (outside lock)
@@ -408,6 +524,8 @@ lfs_write_pending_ssb(void)
   ssb_ptr->magic = SSB_MAGIC;
   ssb_ptr->nblocks = count;
   ssb_ptr->checksum = gc_compute_checksum(lfs.ssb_flush_buf, count);
+  ssb_ptr->timestamp = timestamp;
+  ssb_ptr->next_seg_addr = next_seg;  // Next segment for roll-forward
   memmove(ssb_ptr->entries, lfs.ssb_flush_buf, count * sizeof(struct ssb_entry));
   bwrite(bp);
   brelse(bp);
@@ -422,6 +540,17 @@ lfs_write_pending_ssb(void)
     lfs.reserved_ssb_block = 0;
   }
   release(&lfs.lock);
+}
+
+static void
+lfs_write_pending_ssb(void)
+{
+  uint next_seg;
+  acquire(&lfs.lock);
+  next_seg = lfs.ssb_next_seg;
+  lfs.ssb_next_seg = 0;
+  release(&lfs.lock);
+  lfs_write_pending_ssb_with_next(next_seg);
 }
 
 // Check if we need to flush SSB before allocation and prepare if so
@@ -451,10 +580,25 @@ lfs_prepare_alloc(void)
     lfs.ssb_count = 0;
     // Allocate the LAST block for SSB
     lfs.ssb_pending_block = lfs.log_tail++;
+
+    // Calculate next segment address for roll-forward
+    // After this SSB, allocation will move to the next segment
+    uint cur_seg = (lfs.ssb_pending_block - sb.segstart) / sb.segsize;
+    uint next_seg_start = sb.segstart + (cur_seg + 1) * sb.segsize;
+    if(next_seg_start < sb.size){
+      lfs.ssb_next_seg = next_seg_start;
+    } else if(lfs.free_count > 0){
+      // Will use a free segment
+      lfs.ssb_next_seg = sb.segstart + lfs.free_segs[lfs.free_head] * sb.segsize;
+    } else {
+      lfs.ssb_next_seg = 0;  // No next segment available
+    }
+
     release(&lfs.lock);
     return 1;  // Caller should write pending SSB
   }
 
+  lfs.ssb_next_seg = 0;  // Not at segment boundary
   release(&lfs.lock);
   return 0;
 }
@@ -663,12 +807,16 @@ gc_free_segment(uint seg_idx)
 {
   // Validate segment index
   if(seg_idx >= sb.nsegs){
-    cprintf("gc_free_segment: INVALID seg_idx %d >= nsegs %d\n", seg_idx, sb.nsegs);
     panic("gc_free_segment: invalid segment index");
   }
 
+  // CRITICAL: Flush dirty inodes before freeing the segment
+  // This ensures that any relocated block's inode updates are persisted
+  // BEFORE the old segment can be reused
+  lfs_flush_inodes();
+
   acquire(&lfs.lock);
-  // Add directly to free list (needed for sync operations during GC)
+  // Now safe to add to free list
   if(lfs.free_count < LFS_NSEGS_MAX){
     lfs.free_segs[lfs.free_tail] = seg_idx;
     lfs.free_tail = (lfs.free_tail + 1) % LFS_NSEGS_MAX;
@@ -1165,7 +1313,7 @@ read_from_disk:
     // Add new entry
     if(dirty_inodes.count >= IPB){
       release(&dirty_inodes.lock);
-      lfs_sync();
+      lfs_flush_only();  // Flush only, no checkpoint (recoverable via roll-forward)
       acquire(&dirty_inodes.lock);
     }
     memmove(&dirty_inodes.inodes[dirty_inodes.count], &di_copy, sizeof(di_copy));
@@ -1660,7 +1808,6 @@ lfs_gc(void)
     lfs.gc_failed = 1;
     lfs.gc_running = 0;
     release(&lfs.lock);
-    cprintf("GC: not enough space to run GC (remaining=%d, free_count=0)\n", remaining_in_current);
     return;
   }
   release(&lfs.lock);
@@ -1687,10 +1834,9 @@ lfs_gc(void)
   lfs.gc_running = 0;
   release(&lfs.lock);
 
-  // 5. Sync to persist changes
+  // 5. Sync to persist changes (flushes dirty inodes and writes checkpoint)
   lfs_sync();
 
-  // Free segments are now added directly in gc_free_segment()
   // cprintf("GC: done, %d free segments available\n", lfs.free_count);
   acquire(&lfs.lock);
   if(gc_success && total_cleaned > 0){
@@ -1705,8 +1851,51 @@ lfs_gc(void)
 // End of Garbage Collection Implementation
 // ============================================================================
 
-// Sync: flush dirty inodes, write imap, write checkpoint
-// Called when segment is full, buffer is full, or periodically
+// Flush only: flush dirty inodes and SSB to log, but NO checkpoint
+// Used when dirty buffer is full - data is recoverable via roll-forward
+static void
+lfs_flush_only(void)
+{
+  // Recursion guard
+  acquire(&lfs.lock);
+  if(lfs.syncing || lfs.gc_running){
+    release(&lfs.lock);
+    return;
+  }
+  lfs.syncing = 1;
+  release(&lfs.lock);
+
+  // Check if there's anything to flush
+  acquire(&dirty_inodes.lock);
+  int has_dirty = (dirty_inodes.count > 0);
+  release(&dirty_inodes.lock);
+
+  acquire(&lfs.lock);
+  int has_ssb = (lfs.ssb_count > 0);
+  release(&lfs.lock);
+
+  if(!has_dirty && !has_ssb){
+    acquire(&lfs.lock);
+    lfs.syncing = 0;
+    release(&lfs.lock);
+    return;
+  }
+
+  // 1. Flush dirty inodes to disk (updates in-memory imap)
+  lfs_flush_inodes();
+
+  // 2. Flush SSB (Segment Summary Block)
+  lfs_write_ssb_now();
+
+  // NO checkpoint - data is recoverable via roll-forward
+
+  acquire(&lfs.lock);
+  lfs.syncing = 0;
+  release(&lfs.lock);
+}
+
+// Full sync: flush + write imap/SUT + checkpoint
+// Called on segment switch, periodic timer, or explicit sync request
 void
 lfs_sync(void)
 {
@@ -1724,7 +1913,7 @@ lfs_sync(void)
   acquire(&dirty_inodes.lock);
   int has_dirty = (dirty_inodes.count > 0);
   release(&dirty_inodes.lock);
-  
+
   acquire(&lfs.lock);
   int has_ssb = (lfs.ssb_count > 0);
   release(&lfs.lock);
@@ -1738,7 +1927,7 @@ lfs_sync(void)
 
   // 1. Flush dirty inodes to disk (updates in-memory imap)
   lfs_flush_inodes();
-  
+
   // 2. Flush SSB (Segment Summary Block)
   // Use lfs_write_ssb_now() which handles out-of-space gracefully
   lfs_write_ssb_now();
@@ -1753,7 +1942,7 @@ lfs_sync(void)
   lfs_write_checkpoint();
 
   // Debug: cprintf("LFS sync: log_tail now %d\n", lfs.log_tail);
-  
+
   acquire(&lfs.lock);
   lfs.syncing = 0;
   release(&lfs.lock);
@@ -1883,15 +2072,44 @@ lfs_alloc_with_ssb(uchar ssb_type, uint ssb_inum, uint ssb_offset, uint ssb_vers
 
   // If we are not syncing (regular allocation), we must NEVER allocate
   // from the reserved area (last 2 blocks).
-  // If we are in the reserved area, skip to the next segment.
+  // If we are in the reserved area, write SSB and skip to the next segment.
   if(!lfs.syncing){
-    while((lfs.log_tail - sb.segstart) % sb.segsize != 0){
-      uint off = (lfs.log_tail - sb.segstart) % sb.segsize;
-      uint rem = sb.segsize - off;
-      // Only skip if we are actually in the reserved zone (last 2 blocks)
-      if (rem > 2) break;
+    uint off = (lfs.log_tail - sb.segstart) % sb.segsize;
+    uint rem = sb.segsize - off;
 
-      // Check if we wrap around or hit end of allocation region
+    // If we're in reserved zone (last 2 blocks), flush inodes and write SSB
+    // Use ssb_flushing as guard against recursion from lfs_flush_inodes
+    if(rem <= 2 && rem > 0 && lfs.ssb_count > 0 && !lfs.ssb_flushing){
+      // Mark as flushing FIRST to prevent recursion
+      lfs.ssb_flushing = 1;
+
+      // Reserve first block for SSB (before calling flush which may allocate)
+      uint ssb_block = lfs.log_tail;
+      lfs.log_tail++;  // Reserve this block for SSB
+
+      // Calculate next segment start
+      uint next_seg_start = ((lfs.log_tail - sb.segstart + sb.segsize - 1) / sb.segsize) * sb.segsize + sb.segstart;
+
+      release(&lfs.lock);
+
+      // Flush dirty inodes - allocates blocks AFTER ssb_block
+      lfs_flush_inodes();
+
+      acquire(&lfs.lock);
+
+      // Prepare SSB for writing (now includes inode entries from flush)
+      lfs.ssb_pending_count = lfs.ssb_count;
+      memmove(lfs.ssb_flush_buf, lfs.ssb_buf, lfs.ssb_count * sizeof(struct ssb_entry));
+      lfs.ssb_count = 0;
+      lfs.ssb_pending_block = ssb_block;  // Use reserved block for SSB
+      lfs.ssb_next_seg = next_seg_start;
+    }
+
+    // Skip remaining reserved blocks to next segment
+    while((lfs.log_tail - sb.segstart) % sb.segsize != 0){
+      off = (lfs.log_tail - sb.segstart) % sb.segsize;
+      rem = sb.segsize - off;
+      if (rem > 2) break;
       if(lfs.log_tail >= lfs.cur_seg_end) break;
       lfs.log_tail++;
     }
@@ -1973,14 +2191,11 @@ use_free_segment:
       lfs.sut[free_seg].live_bytes = 0;
       // Update ssb_seg_start for new segment
       lfs.ssb_seg_start = lfs.log_tail;
-      // cprintf("LFS: switching to free segment %d (log_tail=%d)\n",
-      //         free_seg, lfs.log_tail);
     } else {
       // No free segments - try GC one more time before giving up
       if(!lfs.gc_running && !lfs.gc_failed){
         lfs.gc_failed = 0;  // Reset to force another attempt
         release(&lfs.lock);
-        cprintf("lfs_alloc: emergency GC triggered\n");
         lfs_gc();
         acquire(&lfs.lock);
         // Check if GC freed any segments
@@ -2048,19 +2263,6 @@ lfs_flush_inodes(void)
   uint block;
   int i, count;
 
-  // Check if we have space for Inodes + SSB (need at least 2 blocks)
-  // If scarce space remains (<= 2 blocks), skip flushing inodes so SSB can take the last spot.
-  // This prevents SSB from spilling into the next segment.
-  acquire(&lfs.lock);
-  uint offset = (lfs.log_tail - sb.segstart) % sb.segsize;
-  uint remaining = sb.segsize - offset;
-  uint disk_remaining = lfs.cur_seg_end - lfs.log_tail;
-  release(&lfs.lock);
-
-  if(remaining <= 2 || disk_remaining <= 2){
-    return;
-  }
-
   // 1. Move to flushing buffer
   acquire(&dirty_inodes.lock);
   count = dirty_inodes.count;
@@ -2120,6 +2322,196 @@ lfs_flush_inodes(void)
   release(&dirty_inodes.lock);
 }
 
+// ============================================================================
+// Roll-Forward Recovery Implementation
+// Scans log from checkpoint to find and recover data written after checkpoint
+// ============================================================================
+
+// Find the actual end of the log by scanning SSBs from checkpoint's log_tail
+// Uses SSB magic + checksum + next_seg_addr to trace the log
+// Returns the block number of the first invalid/unwritten block
+static uint
+lfs_find_log_end(int dev, uint start_block)
+{
+  struct buf *bp;
+  struct ssb *ssb_ptr;
+  uint current_block = start_block;
+  uint last_valid_end = start_block;
+  int found_ssb_in_seg = 0;
+
+  cprintf("lfs_find_log_end: scanning from block %d\n", start_block);
+
+  // Scan segments forward
+  while(current_block < sb.size){
+    uint seg_idx = (current_block - sb.segstart) / sb.segsize;
+    uint seg_start = sb.segstart + seg_idx * sb.segsize;
+    uint seg_end = seg_start + sb.segsize;
+
+    found_ssb_in_seg = 0;
+
+    // Scan current segment for SSBs
+    for(uint blk = current_block; blk < seg_end && blk < sb.size; blk++){
+      bp = bread(dev, blk);
+      ssb_ptr = (struct ssb *)bp->data;
+
+      // Check for valid SSB
+      if(ssb_ptr->magic == SSB_MAGIC && gc_verify_checksum(ssb_ptr)){
+        found_ssb_in_seg = 1;
+        // This SSB describes blocks written before it
+        last_valid_end = blk + 1;
+
+        // Check if SSB has next_seg_addr (segment boundary marker)
+        if(ssb_ptr->next_seg_addr != 0){
+          brelse(bp);
+          // Jump to next segment
+          current_block = ssb_ptr->next_seg_addr;
+          cprintf("lfs_find_log_end: SSB at %d points to next seg %d\n", blk, current_block);
+          goto next_segment;
+        }
+        brelse(bp);
+        continue;
+      }
+
+      // Check for zeroed block (unwritten)
+      int is_zero = 1;
+      uint *data = (uint*)bp->data;
+      for(int i = 0; i < BSIZE/sizeof(uint); i++){
+        if(data[i] != 0){
+          is_zero = 0;
+          break;
+        }
+      }
+      brelse(bp);
+
+      if(is_zero){
+        // Found unwritten block - this is the end
+        cprintf("lfs_find_log_end: found zero block at %d, end=%d\n", blk, last_valid_end);
+        return last_valid_end;
+      }
+    }
+
+    // Reached end of segment without finding next_seg_addr
+    // If no SSB found in this segment, we're past the valid log
+    if(!found_ssb_in_seg && current_block > start_block){
+      cprintf("lfs_find_log_end: no SSB in segment %d, end=%d\n", seg_idx, last_valid_end);
+      return last_valid_end;
+    }
+
+    // Move to next sequential segment
+    current_block = seg_end;
+    next_segment:;
+  }
+
+  cprintf("lfs_find_log_end: reached disk end, last_valid=%d\n", last_valid_end);
+  return last_valid_end;
+}
+
+// Roll forward from checkpoint, recovering data from SSBs
+// Called after lfs_read_checkpoint() and lfs_read_imap()
+static void
+lfs_rollforward(int dev)
+{
+  uint checkpoint_tail = lfs.log_tail;
+  uint actual_end;
+  struct buf *bp;
+  struct ssb *ssb_ptr;
+  int recovered_inodes = 0;
+
+  // Find actual end of log
+  actual_end = lfs_find_log_end(dev, checkpoint_tail);
+
+  if(actual_end <= checkpoint_tail){
+    cprintf("lfs_rollforward: no data to recover\n");
+    return;
+  }
+
+  cprintf("lfs_rollforward: scanning blocks %d to %d\n", checkpoint_tail, actual_end);
+
+  // Scan from checkpoint to actual end, processing SSBs
+  uint current_block = checkpoint_tail;
+
+  while(current_block < actual_end){
+    uint seg_idx = (current_block - sb.segstart) / sb.segsize;
+    uint seg_start = sb.segstart + seg_idx * sb.segsize;
+    uint seg_end = seg_start + sb.segsize;
+    if(seg_end > actual_end) seg_end = actual_end;
+
+    // Scan segment for SSBs
+    for(uint blk = current_block; blk < seg_end; blk++){
+      bp = bread(dev, blk);
+      ssb_ptr = (struct ssb *)bp->data;
+
+      if(ssb_ptr->magic != SSB_MAGIC || !gc_verify_checksum(ssb_ptr)){
+        brelse(bp);
+        continue;
+      }
+
+      // SSB is valid and located after checkpoint's log_tail
+      // This means it was written after the last checkpoint
+      // (No need to check timestamp - position is sufficient)
+
+      // Process SSB entries
+      for(uint e = 0; e < ssb_ptr->nblocks && e < SSB_ENTRIES_PER_BLOCK; e++){
+        struct ssb_entry *entry = &ssb_ptr->entries[e];
+
+        if(entry->type == SSB_TYPE_INODE){
+          // Recover inode block - update imap
+          // SSB entries are added in order, so entry index corresponds to block offset
+          // Blocks are written BEFORE their SSB, so calculate block address
+          uint inode_block = blk - ssb_ptr->nblocks + e;
+
+          if(inode_block >= checkpoint_tail && inode_block < blk){
+            // Read the inode block
+            struct buf *bp_inode = bread(dev, inode_block);
+            struct dinode *dips = (struct dinode*)bp_inode->data;
+
+            // First inum is stored in entry->inum
+            // Scan all slots in the inode block
+            for(int slot = 0; slot < IPB; slot++){
+              if(dips[slot].type != 0){
+                uint inum = entry->inum + slot;
+                if(inum > 0 && inum < LFS_NINODES){
+                  // Update imap with new location
+                  uint new_entry = IMAP_ENCODE(inode_block, entry->version, slot);
+                  uint old_entry = lfs.imap[inum];
+
+                  // Only update if version is newer or equal
+                  if(old_entry == 0 || old_entry == 0xFFFFFFFF ||
+                     IMAP_VERSION(new_entry) >= IMAP_VERSION(old_entry)){
+                    lfs.imap[inum] = new_entry;
+                    recovered_inodes++;
+                  }
+                }
+              }
+            }
+            brelse(bp_inode);
+          }
+        }
+        // DATA and INDIRECT blocks are recovered through their inodes
+      }
+
+      // Check for segment boundary jump
+      if(ssb_ptr->next_seg_addr != 0 && ssb_ptr->next_seg_addr < sb.size){
+        uint next_seg = ssb_ptr->next_seg_addr;
+        brelse(bp);
+        current_block = next_seg;
+        goto next_seg_rollforward;
+      }
+
+      brelse(bp);
+    }
+
+    current_block = seg_end;
+    next_seg_rollforward:;
+  }
+
+  // Update log_tail to actual end
+  lfs.log_tail = actual_end;
+
+  cprintf("lfs_rollforward: recovered %d inode entries, log_tail updated to %d\n",
+          recovered_inodes, actual_end);
+}
+
 // Inodes.
 //
 // An inode describes a single unnamed file.
@@ -2165,6 +2557,9 @@ iinit(int dev)
   lfs_read_imap(dev);
   lfs_read_sut(dev);
 
+  // Roll-forward recovery: scan log from checkpoint to recover newer data
+  lfs_rollforward(dev);
+
   // Initialize cur_seg_end: sequential allocation up to end of disk
   lfs.cur_seg_end = sb.size;
 
@@ -2207,9 +2602,9 @@ ialloc(uint dev, short type)
       // Add inode to dirty buffer
       acquire(&dirty_inodes.lock);
       if(dirty_inodes.count >= IPB){
-        // Buffer is full - sync before adding
+        // Buffer is full - flush only (no checkpoint, recoverable via roll-forward)
         release(&dirty_inodes.lock);
-        lfs_sync();
+        lfs_flush_only();
         acquire(&dirty_inodes.lock);
       }
       memmove(&dirty_inodes.inodes[dirty_inodes.count], &di, sizeof(di));
@@ -2222,7 +2617,7 @@ ialloc(uint dev, short type)
       release(&dirty_inodes.lock);
 
       if(need_sync){
-        lfs_sync();
+        lfs_flush_only();  // Flush only, no checkpoint
       }
       // NO checkpoint here - Sprite LFS approach
 
@@ -2269,9 +2664,9 @@ iupdate(struct inode *ip)
   if(!found){
     // Add new inode to buffer
     if(dirty_inodes.count >= IPB){
-      // Buffer is full - sync before adding
+      // Buffer is full - flush only (no checkpoint, recoverable via roll-forward)
       release(&dirty_inodes.lock);
-      lfs_sync();
+      lfs_flush_only();
       acquire(&dirty_inodes.lock);
     }
     memmove(&dirty_inodes.inodes[dirty_inodes.count], &di, sizeof(di));
@@ -2280,16 +2675,16 @@ iupdate(struct inode *ip)
     dirty_inodes.count++;
   }
 
-  // Check if we need to sync after adding
+  // Check if we need to flush after adding
   if(dirty_inodes.count >= IPB){
     need_sync = 1;
   }
   release(&dirty_inodes.lock);
 
   if(need_sync){
-    lfs_sync();
+    lfs_flush_only();  // Flush only, no checkpoint
   }
-  // NO checkpoint here - Sprite LFS approach: sync only when buffer is full
+  // NO checkpoint here - Sprite LFS approach: checkpoint only on segment switch or periodic sync
 }
 
 // Find the inode with number inum on device dev
@@ -2475,8 +2870,6 @@ iunlock(struct inode *ip)
 void
 iput(struct inode *ip)
 {
-  int i;
-
   acquiresleep(&ip->lock);
   if(ip->valid && ip->nlink == 0){
     acquire(&icache.lock);
@@ -2487,22 +2880,21 @@ iput(struct inode *ip)
       itrunc(ip);
       ip->type = 0;
 
-      // Remove inode from dirty buffer if present (don't need to persist type=0)
+      // Remove inode from dirty buffer if present
+      // (itrunc called iupdate which added it, but we don't want to persist type=0)
       acquire(&dirty_inodes.lock);
-      for(i = 0; i < dirty_inodes.count; i++){
+      for(int i = 0; i < dirty_inodes.count; i++){
         if(dirty_inodes.inums[i] == ip->inum){
           // Remove by shifting remaining entries
-          for(; i < dirty_inodes.count - 1; i++){
-            memmove(&dirty_inodes.inodes[i], &dirty_inodes.inodes[i+1], sizeof(struct dinode));
-            dirty_inodes.inums[i] = dirty_inodes.inums[i+1];
-            dirty_inodes.versions[i] = dirty_inodes.versions[i+1];
+          for(int j = i; j < dirty_inodes.count - 1; j++){
+            memmove(&dirty_inodes.inodes[j], &dirty_inodes.inodes[j+1], sizeof(struct dinode));
+            dirty_inodes.inums[j] = dirty_inodes.inums[j+1];
+            dirty_inodes.versions[j] = dirty_inodes.versions[j+1];
           }
           dirty_inodes.count--;
           break;
         }
       }
-      // If it's in flushing buffer, we can't remove it (it's being written). 
-      // But we will set imap=0 below, so lfs_flush_inodes will skip updating imap.
       release(&dirty_inodes.lock);
 
       // Mark inode as free in imap
